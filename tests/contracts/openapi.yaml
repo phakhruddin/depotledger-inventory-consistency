@@ -1,0 +1,190 @@
+openapi: 3.1.0
+info:
+  title: DepotLedger Inventory API
+  version: 1.0.0
+  description: >
+    Stock levels and reservations for a multi-warehouse inventory. Every
+    response carries X-Request-Id and X-DepotLedger-Replica (the serving task's
+    hostname). Errors are JSON objects with a `code` and a `detail`.
+paths:
+  /health/live:
+    get:
+      summary: Liveness.
+      responses: {"200": {description: Process is running.}}
+  /health/ready:
+    get:
+      summary: Readiness. Both tables exist and are ACTIVE.
+      responses:
+        "200": {description: Ready.}
+        "503": {description: A table is missing or not ACTIVE.}
+  /stock/{sku}/{warehouse_id}:
+    parameters:
+      - {name: sku, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+      - {name: warehouse_id, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+    put:
+      summary: Set on-hand units and the reorder point for one SKU in one warehouse.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [on_hand]
+              properties:
+                on_hand: {type: integer, minimum: 0}
+                reorder_point: {type: integer, minimum: 0, default: 0}
+      responses:
+        "201": {description: Row created., content: {application/json: {schema: {$ref: "#/components/schemas/Stock"}}}}
+        "200": {description: Row updated., content: {application/json: {schema: {$ref: "#/components/schemas/Stock"}}}}
+        "400": {description: Invalid body.}
+        "409": {description: "`below_reserved`: on_hand would drop below reserved units."}
+    delete:
+      summary: Remove the row.
+      responses:
+        "200": {description: Deleted.}
+        "404": {description: No such row.}
+  /stock/{sku}:
+    get:
+      summary: Every warehouse row for one SKU (base table, consistent read).
+      parameters:
+        - {name: sku, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+      responses:
+        "200":
+          description: Rows ordered by warehouse_id.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sku: {type: string}
+                  locations: {type: array, items: {$ref: "#/components/schemas/Stock"}}
+        "404": {description: Unknown SKU.}
+  /warehouses/{warehouse_id}/stock:
+    get:
+      summary: Every row in one warehouse, answered from the by_warehouse index.
+      parameters:
+        - {name: warehouse_id, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+      responses:
+        "200": {description: Rows ordered by sku., content: {application/json: {schema: {$ref: "#/components/schemas/StockList"}}}}
+        "500": {description: "`index_unavailable` or `index_projection_incomplete`."}
+  /warehouses/{warehouse_id}/low-stock:
+    get:
+      summary: Rows at or below their reorder point, answered from the sparse low_stock index.
+      parameters:
+        - {name: warehouse_id, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+      responses:
+        "200": {description: Rows ordered by sku., content: {application/json: {schema: {$ref: "#/components/schemas/StockList"}}}}
+        "500": {description: "`index_unavailable` or `index_projection_incomplete`."}
+  /reservations:
+    post:
+      summary: Reserve units. Idempotent on order_id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id, sku, warehouse_id, quantity]
+              properties:
+                order_id: {$ref: "#/components/schemas/Id"}
+                sku: {$ref: "#/components/schemas/Id"}
+                warehouse_id: {$ref: "#/components/schemas/Id"}
+                quantity: {type: integer, minimum: 1, maximum: 1000}
+      responses:
+        "201": {description: Reserved., content: {application/json: {schema: {$ref: "#/components/schemas/Reservation"}}}}
+        "200": {description: Replay of an earlier identical order. No additional units taken., content: {application/json: {schema: {$ref: "#/components/schemas/Reservation"}}}}
+        "400": {description: Invalid body.}
+        "409": {description: "`insufficient_stock`, `idempotency_conflict` (same order_id, different body) or `reservation_in_progress` (retry)."}
+  /reservations/{order_id}:
+    get:
+      summary: One reservation.
+      parameters:
+        - {name: order_id, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+      responses:
+        "200": {description: Found., content: {application/json: {schema: {$ref: "#/components/schemas/Reservation"}}}}
+        "404": {description: Unknown order_id.}
+  /admin/snapshots:
+    get:
+      summary: Snapshots in the bucket, newest first, and the current stock table generation.
+      parameters:
+        - {name: X-Admin-Token, in: header, required: true, schema: {type: string}}
+      responses:
+        "200":
+          description: Listing.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  current_generation: {type: [string, "null"]}
+                  snapshots:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key: {type: string}
+                        generation: {type: string}
+                        taken_at_ms: {type: integer}
+                        item_count: {type: integer}
+        "401": {description: Missing or wrong token.}
+  /admin/restore:
+    post:
+      summary: Load a snapshot into the stock table without overwriting existing rows.
+      parameters:
+        - {name: X-Admin-Token, in: header, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [snapshot_key]
+              properties:
+                snapshot_key: {type: string}
+      responses:
+        "200":
+          description: Restored.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  snapshot_key: {type: string}
+                  generation: {type: string}
+                  restored: {type: integer}
+                  skipped: {type: integer}
+        "401": {description: Missing or wrong token.}
+        "404": {description: No such snapshot object.}
+        "409": {description: "`snapshot_generation_current`: the snapshot is of the current table generation."}
+        "503": {description: "`table_unavailable`: the stock table does not exist."}
+components:
+  schemas:
+    Id:
+      type: string
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
+    Stock:
+      type: object
+      properties:
+        sku: {type: string}
+        warehouse_id: {type: string}
+        on_hand: {type: integer}
+        reserved: {type: integer}
+        available: {type: integer}
+        reorder_point: {type: integer}
+        low_stock: {type: boolean}
+        updated_at: {type: string}
+    StockList:
+      type: object
+      properties:
+        warehouse_id: {type: string}
+        items: {type: array, items: {$ref: "#/components/schemas/Stock"}}
+    Reservation:
+      type: object
+      properties:
+        order_id: {type: string}
+        reservation_id: {type: string}
+        sku: {type: string}
+        warehouse_id: {type: string}
+        quantity: {type: integer}
+        status: {type: string, enum: [pending, confirmed]}
+        created_at: {type: string}
