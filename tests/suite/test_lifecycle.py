@@ -11,7 +11,7 @@ from .test_behavior import current_generation, fresh, put_stock, reserve, stock_
 from .tools.deployment import deploy, destroy
 from .tools.errors import CleanupLeak, SubmissionFailure
 from .tools.results import CheckResult, Outcome
-from .tools.terraform import describe_changes, disruptive_changes, plan
+from .tools.terraform import by_type, describe_changes, disruptive_changes, plan, state
 from .tools.trial import TrialContext, obligation
 
 
@@ -155,6 +155,21 @@ def test_reapply_is_stable(trial: TrialContext) -> CheckResult:
 def test_destroy_is_clean(trial: TrialContext) -> CheckResult:
     """Destroy removes what this deployment owns and nothing else."""
     config = trial.config
+
+    # This endpoint's ECS also writes every task's output to a log group it
+    # creates itself, `/ecs/<task definition family>`, whatever awslogs-group
+    # the task definition names. Those groups are the emulator's, not the
+    # submission's, and they can reappear while tasks drain. They are only
+    # excused when the submission did not declare that name itself; a
+    # declared log group that survives destroy is still a leak.
+    try:
+        state_json = state(config.infra_dir)
+    except Exception:  # noqa: BLE001 - no readable state means nothing to excuse
+        state_json = {}
+    declared_groups = {r["values"].get("name") for r in by_type(state_json, "aws_cloudwatch_log_group")}
+    families = {r["values"].get("family") for r in by_type(state_json, "aws_ecs_task_definition")}
+    emulator_groups = {f"/ecs/{family}" for family in families if family} - declared_groups
+
     destroy(config.submission_dir, config.logs_dir)
 
     damaged = trial.cloud.decoys_intact()
@@ -162,6 +177,11 @@ def test_destroy_is_clean(trial: TrialContext) -> CheckResult:
         raise CleanupLeak(f"destroy modified pre-existing resources: {damaged}")
 
     remaining = trial.cloud.prefixed_inventory(config.prefix)
+    excused = sorted(set(remaining.get("log_groups", [])) & emulator_groups)
+    if excused:
+        remaining["log_groups"] = sorted(set(remaining["log_groups"]) - emulator_groups)
+        if not remaining["log_groups"]:
+            remaining.pop("log_groups")
     leaked = {kind: sorted(set(items) - set(trial.baseline.get(kind, []))) for kind, items in remaining.items()}
     leaked = {kind: items for kind, items in leaked.items() if items}
     if leaked:
@@ -175,5 +195,5 @@ def test_destroy_is_clean(trial: TrialContext) -> CheckResult:
     return CheckResult(
         "lifecycle.destroy_clean", Outcome.PASS,
         "no resource carrying this deployment's prefix remains and the legacy resources are intact",
-        details={"baseline_kinds": sorted(trial.baseline)},
+        details={"baseline_kinds": sorted(trial.baseline), "emulator_log_groups_excused": excused},
     )

@@ -149,6 +149,12 @@ echoes it into a log group.
   `ACTIVE` at once. Queries against it read the base table with the index
   projection applied, exactly as a backfilled index would answer.
 - **DynamoDB TTL is enforced.** Expired items are removed.
+- **ECS creates its own log groups.** Besides the `awslogs-group` you
+  configure, this endpoint writes every task's output to a log group it
+  creates itself, named `/ecs/<task definition family>`. Those groups belong
+  to the endpoint, not to your deployment, and destruction is not judged on
+  them. A log group you declare yourself must still be removed by
+  `destroy.sh`.
 - **Bucket default encryption is recorded, not simulated.** Declare it anyway;
   it is checked as configuration.
 - **Security groups and IAM policies are recorded, not enforced.** They are
