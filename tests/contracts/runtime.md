@@ -61,10 +61,15 @@ Every `/admin/*` call must carry `X-Admin-Token: <admin_token>`. Otherwise it
 answers `401`.
 
 - `GET /admin/snapshots` returns the stock table's `current_generation` and
-  every snapshot in the bucket, newest first, each with its `key`,
-  `generation`, `taken_at_ms` and `item_count`.
-- `POST /admin/restore` with `{"snapshot_key": "<key>"}` loads that snapshot
-  into the stock table. It never overwrites a row that already exists: any row
+  every snapshot **data object** in the bucket, newest first, each with its
+  `key`, `generation`, `taken_at_ms` and `item_count`. It does not say whether
+  a snapshot is committed; the commit markers in the bucket are the only
+  record of that.
+- `POST /admin/restore` with `{"snapshot_key": "<key>"}` loads the current
+  version of that snapshot object into the stock table. With
+  `{"snapshot_key": "<key>", "version_id": "<id>"}` it loads exactly that object
+  version. It checks neither commit markers nor hashes: choosing the committed
+  content is the caller's job. It never overwrites a row that already exists: any row
   present is treated as newer than the snapshot. It answers `200` with
   `restored` and `skipped` counts. It refuses with `409` and code
   `snapshot_generation_current` when the snapshot was taken from the current
@@ -91,9 +96,22 @@ Behavior:
   Lines, one stock row per line with every attribute, to
   `snapshots/<generation>/<taken_at_ms>.jsonl`. Object metadata
   `item-count`, `table-generation` and `taken-at-ms` describe it.
-- After each snapshot it overwrites `snapshots/LATEST.json` with
-  `{"key", "generation", "item_count", "taken_at_ms"}`. The bucket's version
-  history is the only record of earlier pointers.
+- **Every snapshot is written in two steps.** First the data object, then a
+  commit marker `snapshots/<generation>/<taken_at_ms>.committed` containing
+  `{"key", "generation", "item_count", "taken_at_ms", "sha256"}`, where
+  `sha256` is the hex SHA-256 of the committed data object's bytes.
+- **What counts as committed.** A snapshot is committed when its marker exists
+  and **some version** of its data object has exactly the marker's `sha256`.
+  That object version is the snapshot's **committed content**. A data object
+  can be overwritten after it was committed, for example by a retried or
+  misconfigured writer. The versioned bucket still holds the committed bytes
+  as an older version, and the current version is then *not* the committed
+  content. A data object with no marker is what a snapshotter that died
+  mid-write leaves behind. It may be incomplete or stale, and it must never be
+  restored.
+- After each committed snapshot it overwrites `snapshots/LATEST.json` with
+  the same fields as the marker. The bucket's version history is the only
+  record of earlier pointers.
 - While the stock table does not exist, it logs `table_missing` and writes
   nothing.
 
@@ -105,10 +123,23 @@ generation.
 ## Restoring after table loss
 
 If the stock table is deleted, the next `deploy.sh` must recreate it and, before
-it returns, restore it from the newest snapshot of the previous generation.
+it returns, restore it from **the committed content of the newest committed
+snapshot of the generation that was live immediately before this loss**,
+meaning the table that was just deleted. Generations are creation times, so
+that is the most recent generation older than the new table. "Newest" is by
+`taken_at_ms` within that generation. If the newest committed snapshot's data
+object has been overwritten since, restore its committed version, not the
+current one, and do not fall back to an older snapshot.
+
 The verifier may delete the table at any point after a successful deploy and
-then run `deploy.sh`. It expects every row captured by the last snapshot of
-the lost table to be served by the API when `deploy.sh` returns.
+then run `deploy.sh`, and it may do so **more than once**, writing, updating
+and deleting rows between losses. After each loss it expects every row of the
+lost generation's newest committed snapshot to be served with that snapshot's
+values when `deploy.sh` returns. Rows deleted or updated before the loss keep
+their pre-loss state. The lost generation may also contain a newer
+**uncommitted** snapshot object, and none of its rows may appear. Its newest
+committed snapshot may also have an overwritten data object, and no row that
+exists only in the overwriting version may appear.
 
 A routine redeploy, where the table was not lost, must not restore anything.
 Rows deleted through the API stay deleted, and rows written after the last
@@ -130,7 +161,9 @@ echoes it into a log group.
 - **Resource refreshes may report non-material drift.** The endpoint does not
   return every field AWS returns, so a refresh can show differences that do not
   reflect a real change. Use `terraform plan -refresh=false` when checking
-  whether configuration and state agree.
+  whether configuration and state agree. Do not rely on `-refresh=false` when
+  *applying*: a deployment has to see real drift on its durable controls (see
+  `services/s3.md`) to repair it.
 
 - **Some attributes cannot be read back in the shape they were written.** The
   difference is recorded in state as soon as `apply` finishes, so it survives

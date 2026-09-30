@@ -119,9 +119,45 @@ done
 
 # ---- restore after table loss -------------------------------------------------
 # A table that was deleted and recreated is a new generation. Each generation
-# is restored at most once, from the newest snapshot of an earlier
-# generation, and a marker object records that it happened. Routine redeploys
-# find the marker and never restore, so rows deleted on purpose stay deleted.
+# is restored at most once, and a marker object records that it happened, so
+# routine redeploys never restore and rows deleted on purpose stay deleted.
+#
+# Source: the generation that was live immediately before this loss (the
+# highest generation older than the current one), and within it the newest
+# COMMITTED snapshot. A snapshot is committed when its .committed marker
+# exists and some VERSION of its data object has the marker's sha256. That
+# version is the committed content and is what gets restored, even if the
+# object was overwritten afterwards. A data object with no marker is what a
+# snapshotter crash mid-write leaves behind and is never restored.
+#
+# Prints "<data key> <version id>" or nothing.
+pick_committed_snapshot() {
+  local current="$1" keys prev key marker_sha versions vid data_sha
+  keys=$("${AWSCLI[@]}" s3api list-objects-v2 --bucket "$BUCKET" --prefix snapshots/ \
+    --query 'Contents[].Key' --output json 2>/dev/null || echo '[]')
+  prev=$(printf '%s' "$keys" | jq -r --arg g "$current" '
+    [.[]? | capture("^snapshots/(?<gen>[0-9]+)/[0-9]+\\.(jsonl|committed)$")? | .gen | tonumber
+     | select(. < ($g | tonumber))] | max // empty')
+  [ -n "$prev" ] || return 0
+  for key in $(printf '%s' "$keys" | jq -r --arg p "$prev" '
+      [.[]? | capture("^snapshots/" + $p + "/(?<ts>[0-9]+)\\.committed$")? | .ts | tonumber]
+      | sort | reverse | .[] | "snapshots/\($p)/\(.).jsonl"'); do
+    "${AWSCLI[@]}" s3api get-object --bucket "$BUCKET" --key "${key%.jsonl}.committed" /tmp/dl-marker.json >/dev/null 2>&1 || continue
+    marker_sha=$(jq -r '.sha256 // empty' /tmp/dl-marker.json)
+    [ -n "$marker_sha" ] || continue
+    versions=$("${AWSCLI[@]}" s3api list-object-versions --bucket "$BUCKET" --prefix "$key" --output json 2>/dev/null \
+      | jq -r --arg k "$key" '[.Versions[]? | select(.Key == $k)] | sort_by(.LastModified) | reverse | .[].VersionId')
+    for vid in $versions; do
+      "${AWSCLI[@]}" s3api get-object --bucket "$BUCKET" --key "$key" --version-id "$vid" /tmp/dl-snapshot.jsonl >/dev/null 2>&1 || continue
+      data_sha=$(sha256sum /tmp/dl-snapshot.jsonl | cut -d' ' -f1)
+      if [ "$data_sha" = "$marker_sha" ]; then
+        printf '%s %s\n' "$key" "$vid"
+        return 0
+      fi
+    done
+    log "skipping $key: no version of the data object matches its commit marker"
+  done
+}
 admin() { edge -H "X-Admin-Token: ${ADMIN_TOKEN}" "$@"; }
 
 listing=""
@@ -140,13 +176,14 @@ marker="restores/${generation}.json"
 if "${AWSCLI[@]}" s3api head-object --bucket "$BUCKET" --key "$marker" >/dev/null 2>&1; then
   log "generation $generation already reconciled"
 else
-  source_key=$(printf '%s' "$listing" | jq -r --arg g "$generation" \
-    '[.snapshots[] | select(.generation != $g)] | first | .key // empty')
+  source=$(pick_committed_snapshot "$generation")
+  source_key="${source%% *}"
+  source_version="${source#* }"
   result='{"restored":0}'
   if [ -n "$source_key" ]; then
-    log "stock table generation $generation is new; restoring from $source_key"
+    log "stock table generation $generation is new; restoring $source_key version $source_version"
     result=$(admin -X POST -H 'Content-Type: application/json' \
-      -d "$(jq -cn --arg k "$source_key" '{snapshot_key: $k}')" \
+      -d "$(jq -cn --arg k "$source_key" --arg v "$source_version" '{snapshot_key: $k, version_id: $v}')" \
       -w '\n%{http_code}' "${CONNECT_URL}/admin/restore")
     status=$(printf '%s' "$result" | tail -n1)
     result=$(printf '%s' "$result" | sed '$d')

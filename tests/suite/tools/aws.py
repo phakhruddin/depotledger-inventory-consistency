@@ -89,6 +89,54 @@ class Cloud:
                         if o["Key"].endswith(".jsonl"))
         return keys
 
+    def is_committed(self, bucket: str, key: str) -> bool:
+        """A snapshot is committed when its marker exists and its sha256 matches."""
+        import hashlib
+        try:
+            marker = json.loads(self.s3.get_object(
+                Bucket=bucket, Key=key[: -len(".jsonl")] + ".committed")["Body"].read())
+            body = self.s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        except Exception:  # noqa: BLE001 - absent marker or object
+            return False
+        return marker.get("sha256") == hashlib.sha256(body).hexdigest()
+
+    def plant_overwritten_snapshot(self, bucket: str, generation: str, committed_rows: list[dict[str, Any]],
+                                   overwritten_rows: list[dict[str, Any]]) -> tuple[str, str]:
+        """Write a committed snapshot, then overwrite its data object.
+
+        Follows the public commit protocol exactly (data object, then marker
+        with the data object's sha256), then writes a second version of the
+        data object with different content. Returns (key, committed version).
+        """
+        import hashlib
+        taken = int(time.time() * 1000) + 60_000
+        key = f"snapshots/{generation}/{taken}.jsonl"
+
+        def body(rows):
+            return "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows).encode()
+
+        committed = body(committed_rows)
+        meta = {"item-count": str(len(committed_rows)), "table-generation": generation, "taken-at-ms": str(taken)}
+        first = self.s3.put_object(Bucket=bucket, Key=key, Body=committed,
+                                   ContentType="application/x-ndjson", Metadata=meta)
+        version = first.get("VersionId")
+        marker = {"key": key, "generation": generation, "item_count": len(committed_rows),
+                  "taken_at_ms": taken, "sha256": hashlib.sha256(committed).hexdigest()}
+        self.s3.put_object(Bucket=bucket, Key=key[: -len(".jsonl")] + ".committed",
+                           Body=json.dumps(marker).encode(), ContentType="application/json")
+        self.s3.put_object(Bucket=bucket, Key=key, Body=body(overwritten_rows),
+                           ContentType="application/x-ndjson",
+                           Metadata=dict(meta, **{"item-count": str(len(overwritten_rows))}))
+        # Without versioning the committed bytes are simply gone: that is the
+        # submission's defect (the contract requires versioning), not ours.
+        from .errors import SubmissionFailure
+        if not version or version == "null":
+            raise SubmissionFailure("the snapshot bucket returned no version id; versioning is not in effect")
+        stored = self.s3.get_object(Bucket=bucket, Key=key, VersionId=version)["Body"].read()
+        if hashlib.sha256(stored).hexdigest() != marker["sha256"]:
+            raise SubmissionFailure("the committed version was not retained after the overwrite")
+        return key, version
+
     def read_snapshot(self, bucket: str, key: str) -> list[dict[str, Any]]:
         body = self.s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
         return [json.loads(line) for line in body.splitlines() if line.strip()]

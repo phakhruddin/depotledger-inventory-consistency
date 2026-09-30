@@ -61,3 +61,13 @@ rv oracle     # runs the reference solution through the full verifier; expect 10
 See [`panel-taskversion3.md`](panel-taskversion3.md). Results: 1 true pass (Gemini, 100). 5 false fails (Opus, GPT Sol ×3, Gemini; each 91 raw capped at 79,
 all from the emulator's auto-created `/ecs/<family>` log groups; the verifier is fixed in the working tree). 1 invalid (Opus, killed by the host). 1 extra true fail
 (Astra, pinned a solve-time prefix). With the fix, 6 of 7 valid attempts score 100, so the task is far too easy. Raise difficulty (v5) before the next panel.
+
+## v6i candidate (not promoted, oracle pending)
+
+This is a copy of the v6 candidate (the state uploaded as Realm v7: A committed
+snapshots with a two-loss recovery, and B same-bucket drift repair) plus I:
+committed content survives an overwrite. A committed snapshot is the object
+version that matches its marker, and the restore endpoint accepts `version_id`.
+The first table loss now plants a committed-then-overwritten snapshot. It keeps
+the 16 obligations and weights of v7. Known-bad set:
+`../depotledger-certification-v6i/`.

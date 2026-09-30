@@ -80,11 +80,19 @@ about restores. `services/s3.md` gives the required bucket configuration, and
    others keep their identity and contents. For example, after the stock table
    is lost, the reservations table still answers replays of earlier orders,
    and the bucket still holds every earlier snapshot version.
-3. **A lost stock table is restored.** See *Restoring after table loss* in
-   `runtime.md`.
+3. **A lost stock table is restored from a committed snapshot of the
+   generation that was just lost.** The table may be lost more than once. See
+   *Restoring after table loss* in `runtime.md`.
 4. **Nothing is resurrected.** Restores happen only into a new table
-   generation, never into the table they were taken from.
-5. **Destruction removes it all.** `destroy.sh` deletes both tables and the
+   generation, never into the table they were taken from, never from an older
+   generation, never from an uncommitted snapshot object, and never from a
+   version of a data object that does not match its commit marker.
+5. **The bucket's durable controls repair in place.** If bucket versioning is
+   suspended or the lifecycle configuration is removed outside Terraform, the
+   next `deploy.sh` must restore both on the same bucket. The bucket must keep
+   its name and identity, and every existing object version must be kept.
+   Recreating the bucket, or emptying it to "reset" it, is a failure.
+6. **Destruction removes it all.** `destroy.sh` deletes both tables and the
    bucket, including every object version and delete marker.
 
 ## Pre-existing resources

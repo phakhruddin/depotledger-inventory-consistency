@@ -312,11 +312,17 @@ def restore(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     if generation == current:
         raise ApiError(409, "snapshot_generation_current",
                        "a snapshot of the current table generation cannot be restored into it")
+    version_id = body.get("version_id")
+    if version_id is not None and (not isinstance(version_id, str) or not version_id.strip()):
+        raise ApiError(400, "invalid_request", "version_id must be a non-empty string")
     try:
-        raw, _ = S3.get_object(SNAPSHOT_BUCKET, key)
+        # Without version_id the current version is loaded. With it, exactly
+        # that object version, which is how committed content is recovered
+        # after the data object was overwritten.
+        raw, _ = S3.get_object(SNAPSHOT_BUCKET, key, version_id)
     except AwsError as exc:
-        if exc.status == 404:
-            raise ApiError(404, "not_found", "snapshot object does not exist") from exc
+        if exc.status in (400, 404):
+            raise ApiError(404, "not_found", "snapshot object or version does not exist") from exc
         raise
     restored = skipped = 0
     for line in raw.decode("utf-8").splitlines():
@@ -332,8 +338,9 @@ def restore(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             if exc.code != "ConditionalCheckFailedException":
                 raise
             skipped += 1
-    log("restore_completed", snapshot_key=key, restored=restored, skipped=skipped)
-    return 200, {"snapshot_key": key, "generation": generation, "restored": restored, "skipped": skipped}
+    log("restore_completed", snapshot_key=key, version_id=version_id, restored=restored, skipped=skipped)
+    return 200, {"snapshot_key": key, "version_id": version_id, "generation": generation,
+                 "restored": restored, "skipped": skipped}
 
 
 # -- HTTP ----------------------------------------------------------------------

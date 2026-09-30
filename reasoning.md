@@ -74,6 +74,50 @@ package index.
    conditional update makes this correct *if* both replicas share the right
    table and key. Overselling caps the score.
 
+### What v6 adds, and why
+
+Realm v5 produced five 100% runs out of six. v6 adds two operational rules,
+both stated in the public contract and both triggered by the verifier
+deterministically, with no timing races.
+
+6. **Committed snapshots and two losses.** The snapshotter now writes each
+   snapshot in two steps: the data object, then a `.committed` marker carrying
+   the object's SHA-256. Only a marker whose `sha256` matches makes a snapshot
+   restorable. The verifier loses the stock table twice. Between the losses it
+   deletes one row, updates another and adds a third. Before the second loss
+   it leaves the exact state a snapshotter crash produces: a newer data object
+   in the live generation with no marker, holding the deleted row, the stale
+   value and a foreign row. Restore must come from the newest committed
+   snapshot of the generation that was just lost. The v5 rule every passing
+   model used, "newest snapshot of any non-current generation", picks the
+   uncommitted object.
+7. **Durable-control drift repair on the same bucket.** Versioning is suspended
+   and the lifecycle configuration deleted through the S3 API. The next deploy
+   must repair both on the same bucket, keep every earlier object version, and
+   retain new pointer versions again. Deployments that apply with
+   `-refresh=false`, or "reset" by replacing the bucket, fail.
+
+8. **Committed content survives an overwrite (v6i, after Realm v7: 3 of 6
+   full passes).** "Committed" now means that the marker exists **and some
+   version** of the data object matches the marker's `sha256`. That version
+   is the committed content, even if the object was overwritten afterwards.
+   Before the first loss, the verifier writes the newest committed snapshot
+   of the generation by the public protocol: data object, then marker. Its
+   committed content is the natural snapshot plus one late row. It then
+   overwrites the data object with stale content: a dropped row plus a poison
+   row. Only restoring the matching **version**, through the new `version_id`
+   on the restore endpoint, passes:
+   - "marker exists → restore current" brings back the poison row;
+   - "verify current hash, else skip" falls back to the older snapshot and
+     misses the late row;
+   - the v5 "newest non-current" rule does both.
+
+   This makes versioning a recovery control, not only a checkbox. It uses
+   only emulator behaviors already exercised by passing oracles: versioned
+   PUT/GET by `VersionId` and `ListObjectVersions`. No Terraform or provider
+   change is involved; the online-index idea (D) was dropped after the
+   provider could not observe a GSI added in place on Floci.
+
 ### What this environment enforces, and what it only records
 
 The pinned emulator **executes** DynamoDB conditional writes, key schemas,
@@ -161,7 +205,8 @@ sequenceDiagram
     alt marker exists (routine redeploy)
         D-->>V: done, nothing restored
     else new generation
-        D->>D: pick newest snapshot with generation != G'
+        D->>D: prev = highest generation < G'
+        D->>D: newest .committed marker in prev whose sha256 matches its data object
         D->>API: POST /admin/restore {snapshot_key}
         API->>B: get snapshot
         API->>API: PutItem each row IF attribute_not_exists
@@ -192,73 +237,46 @@ flowchart TD
 
 ## Score
 
-Fourteen obligations, each all-or-nothing, grouped into five categories. The
-weights reconcile to 100 in `tests/suite/obligations.yaml`, and the verifier
-refuses to start if they do not. Only 100 passes.
+Sixteen obligations, each all-or-nothing, in five categories. The weights
+reconcile to 100 in `tests/suite/obligations.yaml`. Only 100 passes.
 
 | Category | Points | Obligations |
 |---|---:|---|
-| Snapshot durability and restore | 30 | `lifecycle.table_loss_restore` 14, `observed.snapshots_versioned` 6, `declared.snapshot_bucket` 5, `lifecycle.redeploy_preserves_data` 5 |
-| Inventory consistency | 26 | `observed.no_oversell` 12, `observed.stock_roundtrip` 8, `observed.idempotent_reservation` 6 |
-| Table and index design | 22 | `declared.table_design` 8, `realized.data_plane` 8, `observed.low_stock_index` 6 |
-| Redeploy and destruction | 13 | `lifecycle.destroy_clean` 9, `lifecycle.reapply_stable` 4 |
-| Managed platform and isolation | 9 | `declared.network_and_iam` 5, `declared.managed_iac` 4 |
+| Snapshot durability, restore and repair | 45 | `lifecycle.second_loss_committed` 13, `lifecycle.table_loss_restore` 9, `lifecycle.bucket_drift_repair` 9, `lifecycle.redeploy_preserves_data` 5, `observed.snapshots_versioned` 5, `declared.snapshot_bucket` 4 |
+| Inventory consistency | 20 | `observed.no_oversell` 9 (gate), `observed.stock_roundtrip` 6, `observed.idempotent_reservation` 5 |
+| Table and index design | 17 | `declared.table_design` 6, `realized.data_plane` 6, `observed.low_stock_index` 5 |
+| Redeploy and destruction | 10 | `lifecycle.destroy_clean` 6 (gate), `lifecycle.reapply_stable` 4 |
+| Managed platform and isolation | 8 | `declared.managed_iac` 4 (gate), `declared.network_and_iam` 4 |
 
-By plane: 38 points observed through real requests, 32 lifecycle, 8 realized
-from live APIs, and 22 declared from state.
+By plane: 46 lifecycle, 30 observed, 6 realized, 18 declared.
 
-What each proves, highest value first:
+Run order: declared → realized → observed → routine redeploy → drift
+repair → first loss → second loss → standalone plan → destroy.
 
-- **`lifecycle.table_loss_restore` (14).** Rows are seeded and captured in a
-  snapshot. The stock table is deleted and `deploy.sh` is rerun. When it
-  returns, every row of that snapshot is served with the same `on_hand` and
-  `reserved`. The reservations table (by ARN and creation time), the bucket and
-  the ALB keep their identity. An earlier order still replays without taking
-  stock, and earlier snapshot versions are still present.
-- **`observed.no_oversell` (12, gate).** Thirty concurrent single-unit
-  reservations on a ten-unit row. Exactly ten succeed and twenty are refused
-  as `insufficient_stock`. The row ends at `available 0 / reserved 10`. More
-  than ten successes caps the run at 49.
-- **`observed.stock_roundtrip` (8).** Fresh rows read back by SKU, and the
-  warehouse view returns exactly that warehouse's rows from the index.
-- **`declared.table_design` (8).** Key schema and key types for both tables,
-  both GSIs with exact keys and a sufficient projection, on-demand billing,
-  PITR and TTL, all from state.
-- **`realized.data_plane` (8).** The same facts as the endpoint reports them
-  live (`DescribeTable`, `DescribeTimeToLive`, `DescribeContinuousBackups`,
-  `GetBucketVersioning`), plus healthy target count and exactly one
-  snapshotter.
-- **`lifecycle.destroy_clean` (9, gate).** After `destroy.sh`, nothing
-  carrying the prefix remains, versioned bucket included. The pre-created
-  legacy table (with its row) and legacy bucket (with its versions) are
-  intact. A leak or collateral deletion caps the run at 79.
-- **`observed.low_stock_index` (6).** A row enters the sparse index when a
-  reservation takes it to its reorder point and leaves it after restock. Low
-  rows in other warehouses never appear.
-- **`observed.idempotent_reservation` (6).** An identical replay returns the
-  original `reservation_id` with `200` and takes no units. A conflicting
-  replay is refused. The stored claim carries `expires_at` about
-  `idempotency_ttl_seconds` in the future.
-- **`observed.snapshots_versioned` (6).** A fresh row appears in a snapshot of
-  the current generation within four intervals, `LATEST.json` points at the
-  current generation, and it has more than one retained version.
-- **`declared.snapshot_bucket` (5).** Versioning, a full public access block,
-  default encryption, and noncurrent expiry equal to the per-run retention
-  value. Encryption and lifecycle are labelled declaration-only.
-- **`lifecycle.redeploy_preserves_data` (5).** A row is deleted after it was
-  snapshotted, another is written, and deploy is rerun. Identities are
-  unchanged, the deleted row stays deleted, and the newer row survives.
-- **`declared.network_and_iam` (5).** Tasks run in private subnets without
-  public IPs. The API and snapshotter have distinct task roles. The API role
-  cannot put or delete objects, the snapshotter role cannot write items, and
-  no policy is a wildcard. Declaration only.
-- **`declared.managed_iac` (4, gate).** Every scored resource family is in
-  state and the manifest resolves to it.
-- **`lifecycle.reapply_stable` (4).** `terraform plan -refresh=false` run
-  directly against `infra/` resolves every variable and plans no create or
-  delete.
+- **`lifecycle.second_loss_committed` (13).** After the first recovery, the
+  live generation diverges and a committed snapshot captures it. An
+  uncommitted, newer data object of the same generation, holding stale and
+  foreign rows, is placed in the bucket. The table is deleted again. When
+  deploy returns: every row of the newest committed snapshot is served with
+  its values, the deleted row stays deleted, the updated row keeps its new
+  value, no uncommitted-only row appears, and the reservations table, bucket
+  and ALB keep their identity.
+- **`lifecycle.bucket_drift_repair` (9).** The fault is confirmed applied. Then:
+  same bucket name and creation date, versioning `Enabled`, the rule back with
+  the configured days, every earlier pointer version retrievable, and new
+  versions accruing.
+- **`lifecycle.table_loss_restore` (9).** The first loss. The newest committed
+  snapshot's data object has been overwritten. When deploy returns, every row
+  of its committed content (the version matching the marker) must be served,
+  including the late row that exists only there. No row of the overwriting
+  version may appear.
+- All other obligations are as in v5 at the weights above. The destroy check
+  keeps the emulator `/ecs/<family>` log-group exclusion.
 
-Gates: `trial.integrity` (harness faults invalidate rather than score),
-`declared.managed_iac`, `observed.no_oversell` and
+Gates: `trial.integrity`, `declared.managed_iac`, `observed.no_oversell`,
 `lifecycle.baseline_preserved`. Caps: oversell → 49, cleanup leak or
 collateral deletion → 79.
+
+Known-bad coverage lives beside the task in `../depotledger-certification-v6/`:
+ten variants, including `restore_ignores_commit` (the v5 rule),
+`drift_apply_without_refresh` and `drift_recreate_bucket`.

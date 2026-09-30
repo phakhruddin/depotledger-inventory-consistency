@@ -141,6 +141,7 @@ paths:
               required: [snapshot_key]
               properties:
                 snapshot_key: {type: string}
+                version_id: {type: string, description: "Load exactly this object version instead of the current one."}
       responses:
         "200":
           description: Restored.
@@ -150,11 +151,12 @@ paths:
                 type: object
                 properties:
                   snapshot_key: {type: string}
+                  version_id: {type: [string, "null"]}
                   generation: {type: string}
                   restored: {type: integer}
                   skipped: {type: integer}
         "401": {description: Missing or wrong token.}
-        "404": {description: No such snapshot object.}
+        "404": {description: No such snapshot object or version.}
         "409": {description: "`snapshot_generation_current`: the snapshot is of the current table generation."}
         "503": {description: "`table_unavailable`: the stock table does not exist."}
 components:

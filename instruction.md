@@ -124,13 +124,19 @@ through `deploy.sh`.
 6. Rerunning `deploy.sh` on a healthy deployment changes nothing durable: no
    table or bucket is replaced, deleted rows stay deleted, and newer rows
    survive.
-7. If the stock table is deleted, rerunning `deploy.sh` brings it back with
-   every row from the last snapshot of the lost table before the script
-   returns. The reservations table, the bucket and the load balancer keep
-   their identity.
-8. A standalone `terraform plan -refresh=false` against `infra/` shows nothing
+7. If the stock table is deleted, rerunning `deploy.sh` brings it back, before
+   the script returns, with every row of the **committed content** of the
+   newest committed snapshot of the generation that was just lost. That may be
+   an older version of an overwritten data object; `runtime.md` defines
+   "committed". The table may be lost more than once, and uncommitted or
+   overwritten content must never be restored. The
+   reservations table, the bucket and the load balancer keep their identity.
+8. If bucket versioning is suspended and the lifecycle rule deleted outside
+   Terraform, rerunning `deploy.sh` restores both on the same bucket without
+   losing a single object version.
+9. A standalone `terraform plan -refresh=false` against `infra/` shows nothing
    to create or delete.
-9. `destroy.sh` removes everything this deployment owns and nothing else.
+10. `destroy.sh` removes everything this deployment owns and nothing else.
 
 ## Scoring
 
@@ -138,11 +144,11 @@ The score is weighted by category. A run passes only at 100.
 
 | Category | Points |
 |---|---:|
-| Table and index design | 22 |
-| Inventory consistency | 26 |
-| Snapshot durability and restore | 30 |
-| Managed platform and isolation | 9 |
-| Redeploy and destruction | 13 |
+| Table and index design | 17 |
+| Inventory consistency | 20 |
+| Snapshot durability, restore and repair | 45 |
+| Managed platform and isolation | 8 |
+| Redeploy and destruction | 10 |
 | **Total** | **100** |
 
 Overselling stock, or deleting a resource this deployment does not own, caps

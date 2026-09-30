@@ -212,10 +212,13 @@ def wait_for_snapshot_containing(trial: TrialContext, generation: str, rows: set
     while time.monotonic() < deadline:
         keys = sorted((k for k in trial.cloud.snapshot_keys(trial.bucket)
                        if k.startswith(f"snapshots/{generation}/")), reverse=True)
-        if keys:
-            content = {(r.get("sku"), r.get("warehouse_id")) for r in trial.cloud.read_snapshot(trial.bucket, keys[0])}
+        # Only committed snapshots count: the supplied snapshotter writes the
+        # data object first and its commit marker second.
+        committed = [k for k in keys if trial.cloud.is_committed(trial.bucket, k)]
+        if committed:
+            content = {(r.get("sku"), r.get("warehouse_id")) for r in trial.cloud.read_snapshot(trial.bucket, committed[0])}
             if rows <= content:
-                return keys[0]
+                return committed[0]
         time.sleep(3)
     return None
 
