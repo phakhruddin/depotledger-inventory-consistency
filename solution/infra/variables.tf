@@ -7,10 +7,6 @@ variable "aws_endpoint_url" { type = string }
 variable "resource_prefix" { type = string }
 variable "api_image" { type = string }
 variable "snapshotter_image" { type = string }
-variable "admin_token" {
-  type      = string
-  sensitive = true
-}
 variable "api_desired_count" { type = number }
 variable "snapshot_interval_seconds" { type = number }
 variable "idempotency_ttl_seconds" { type = number }

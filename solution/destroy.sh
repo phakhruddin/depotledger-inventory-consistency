@@ -23,7 +23,7 @@ fi
 if [ ! -f "${INFRA_DIR}/config.auto.tfvars.json" ]; then
   jq '{
       region, aws_endpoint_url, resource_prefix, api_image, snapshotter_image,
-      admin_token, api_desired_count, snapshot_interval_seconds,
+      api_desired_count, snapshot_interval_seconds,
       idempotency_ttl_seconds, snapshot_noncurrent_retention_days
     }' "$CONFIG_PATH" > "${INFRA_DIR}/config.auto.tfvars.json"
 fi

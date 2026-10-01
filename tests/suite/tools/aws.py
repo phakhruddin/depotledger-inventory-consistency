@@ -89,6 +89,104 @@ class Cloud:
                         if o["Key"].endswith(".jsonl"))
         return keys
 
+    def is_committed(self, bucket: str, key: str) -> bool:
+        """A snapshot is committed when its marker exists and its sha256 matches."""
+        import hashlib
+        try:
+            marker = json.loads(self.s3.get_object(
+                Bucket=bucket, Key=key[: -len(".jsonl")] + ".committed")["Body"].read())
+            body = self.s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        except Exception:  # noqa: BLE001 - absent marker or object
+            return False
+        return marker.get("sha256") == hashlib.sha256(body).hexdigest()
+
+    def plant_overwritten_snapshot(self, bucket: str, generation: str, committed_rows: list[dict[str, Any]],
+                                   overwritten_rows: list[dict[str, Any]]) -> tuple[str, str]:
+        """Write a committed snapshot, then overwrite its data object.
+
+        Follows the public commit protocol exactly (data object, then marker
+        with the data object's sha256), then writes a second version of the
+        data object with different content. Returns (key, committed version).
+        """
+        import hashlib
+        taken = int(time.time() * 1000) + 60_000
+        key = f"snapshots/{generation}/{taken}.jsonl"
+
+        def body(rows):
+            return "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows).encode()
+
+        committed = body(committed_rows)
+        meta = {"item-count": str(len(committed_rows)), "table-generation": generation, "taken-at-ms": str(taken)}
+        first = self.s3.put_object(Bucket=bucket, Key=key, Body=committed,
+                                   ContentType="application/x-ndjson", Metadata=meta)
+        version = first.get("VersionId")
+        marker = {"key": key, "generation": generation, "item_count": len(committed_rows),
+                  "taken_at_ms": taken, "sha256": hashlib.sha256(committed).hexdigest()}
+        self.s3.put_object(Bucket=bucket, Key=key[: -len(".jsonl")] + ".committed",
+                           Body=json.dumps(marker).encode(), ContentType="application/json")
+        self.s3.put_object(Bucket=bucket, Key=key, Body=body(overwritten_rows),
+                           ContentType="application/x-ndjson",
+                           Metadata=dict(meta, **{"item-count": str(len(overwritten_rows))}))
+        # Without versioning the committed bytes are simply gone: that is the
+        # submission's defect (the contract requires versioning), not ours.
+        from .errors import SubmissionFailure
+        if not version or version == "null":
+            raise SubmissionFailure("the snapshot bucket returned no version id; versioning is not in effect")
+        stored = self.s3.get_object(Bucket=bucket, Key=key, VersionId=version)["Body"].read()
+        if hashlib.sha256(stored).hexdigest() != marker["sha256"]:
+            raise SubmissionFailure("the committed version was not retained after the overwrite")
+        return key, version
+
+    def batch_put_rows(self, table: str, rows: list[dict[str, Any]]) -> None:
+        """Write rows in the data-model shape directly with BatchWriteItem."""
+        def encode(value: Any) -> dict[str, Any]:
+            if isinstance(value, bool):
+                return {"BOOL": value}
+            if isinstance(value, (int, float)):
+                return {"N": str(value)}
+            return {"S": str(value)}
+
+        for start in range(0, len(rows), 25):
+            pending = {table: [{"PutRequest": {"Item": {k: encode(v) for k, v in row.items()}}}
+                               for row in rows[start:start + 25]]}
+            for _ in range(20):
+                unprocessed = self.ddb.batch_write_item(RequestItems=pending).get("UnprocessedItems") or {}
+                if not unprocessed:
+                    break
+                pending = unprocessed
+                time.sleep(0.2)
+            else:
+                from .errors import HarnessError
+                raise HarnessError("the endpoint kept returning unprocessed items while seeding rows")
+
+    def count_rows(self, table: str) -> int | None:
+        """Consistent row count, or None while the table does not exist."""
+        total, kwargs = 0, {"TableName": table, "Select": "COUNT", "ConsistentRead": True}
+        try:
+            while True:
+                page = self.ddb.scan(**kwargs)
+                total += int(page.get("Count", 0))
+                if "LastEvaluatedKey" not in page:
+                    return total
+                kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+        except self.ddb.exceptions.ResourceNotFoundException:
+            return None
+
+    def scan_items(self, table: str) -> list[dict[str, Any]]:
+        """Every item, in raw DynamoDB attribute-value form."""
+        items, kwargs = [], {"TableName": table, "ConsistentRead": True}
+        while True:
+            page = self.ddb.scan(**kwargs)
+            items.extend(page.get("Items", []))
+            if "LastEvaluatedKey" not in page:
+                return items
+            kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+    def newest_committed(self, bucket: str, generation: str) -> str | None:
+        keys = sorted((k for k in self.snapshot_keys(bucket) if k.startswith(f"snapshots/{generation}/")),
+                      reverse=True)
+        return next((k for k in keys if self.is_committed(bucket, k)), None)
+
     def read_snapshot(self, bucket: str, key: str) -> list[dict[str, Any]]:
         body = self.s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
         return [json.loads(line) for line in body.splitlines() if line.strip()]

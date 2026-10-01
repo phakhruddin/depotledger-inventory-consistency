@@ -11,6 +11,21 @@ Neither table may be replaced by a routine redeploy. Choose names and settings
 that are stable across runs: the name must be derived from `resource_prefix`
 and must not change between deployments of the same configuration.
 
+## Restore writes
+
+A restore after table loss writes rows straight into the replacement stock
+table (see *Restoring after table loss* in `runtime.md`). The endpoint
+supports what that needs:
+
+- `DescribeTable` returns `CreationDateTime`, from which the generation is
+  computed.
+- `PutItem` with `ConditionExpression: attribute_not_exists(sku)` writes a row
+  only if no row with that key exists, and fails with
+  `ConditionalCheckFailedException` otherwise. Treat that failure as "already
+  present, keep it". Concurrent conditional writes are safe.
+- `BatchWriteItem` takes no condition and replaces existing items. It is not a
+  safe way to restore into a table that may already hold newer rows.
+
 ## Manifest fields
 
 Record in `manifest.data`:

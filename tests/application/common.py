@@ -58,6 +58,11 @@ def snapshot_key(generation: str, taken_at_ms: int) -> str:
     return f"{SNAPSHOT_PREFIX}{generation}/{taken_at_ms}.jsonl"
 
 
+def commit_key(data_key: str) -> str:
+    """The commit marker that makes a snapshot restorable."""
+    return data_key[: -len(".jsonl")] + ".committed"
+
+
 def parse_snapshot_key(key: str) -> tuple[str, int] | None:
     if not key.startswith(SNAPSHOT_PREFIX) or not key.endswith(".jsonl"):
         return None

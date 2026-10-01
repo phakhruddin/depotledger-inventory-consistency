@@ -11,8 +11,8 @@ you are building.
 
 The application is provided as two ready to run container images:
 
-1. The **API image** serves stock, reservations and an admin surface over
-   HTTP. Run it as an ECS service behind a public Application Load Balancer,
+1. The **API image** serves stock and reservations over HTTP. It has no
+   snapshot or restore endpoints. Run it as an ECS service behind a public Application Load Balancer,
    with `api_desired_count` replicas.
 2. The **snapshotter image** continuously writes JSON Lines snapshots of the
    stock table to a versioned S3 bucket. Run exactly one as an ECS service
@@ -58,7 +58,7 @@ variables listed in `runtime.md`.
 Read configuration values dynamically from `/workspace/config/config.json` at
 execution time. Terraform or OpenTofu, lifecycle scripts, readiness checks and
 manifest generation must not hard code values copied from the current
-contents of that file. The resource prefix, admin token, TTL and retention
+contents of that file. The resource prefix, TTL and retention
 values are generated fresh for every run.
 
 During verification, your submission is not run where you wrote it. Harbor
@@ -86,7 +86,8 @@ Do not modify the contracts or the supplied images.
   DepotLedger resources exist, repair managed resources deleted after a
   previous deployment, and finish only when the service is ready as defined in
   `services/ecs.md`. That includes restoring a lost stock table as described
-  in `runtime.md`. It has 720 seconds and may produce at most 8 MiB of
+  in `runtime.md`, which your deployment does itself, directly against S3 and
+  DynamoDB. It has 720 seconds and may produce at most 8 MiB of
   combined output.
 - `destroy.sh` removes only the resources belonging to this deployment,
   including the versioned bucket and all its versions, and must not modify
@@ -124,13 +125,23 @@ through `deploy.sh`.
 6. Rerunning `deploy.sh` on a healthy deployment changes nothing durable: no
    table or bucket is replaced, deleted rows stay deleted, and newer rows
    survive.
-7. If the stock table is deleted, rerunning `deploy.sh` brings it back with
-   every row from the last snapshot of the lost table before the script
-   returns. The reservations table, the bucket and the load balancer keep
-   their identity.
-8. A standalone `terraform plan -refresh=false` against `infra/` shows nothing
+7. If the stock table is deleted, rerunning `deploy.sh` brings it back, before
+   the script returns, with every row of the **committed content** of the
+   newest committed snapshot of the generation that was just lost. That may be
+   an older version of an overwritten data object; `runtime.md` defines
+   "committed". The table may be lost more than once, and uncommitted or
+   overwritten content must never be restored. Restored rows never overwrite
+   rows that already exist. The reservations table, the bucket and the load
+   balancer keep their identity.
+8. A restore that is killed part way, after the first restored row lands, is
+   finished by the next `deploy.sh`, and rows written to the replacement table
+   in between keep their newer values.
+9. If bucket versioning is suspended and the lifecycle rule deleted outside
+   Terraform, rerunning `deploy.sh` restores both on the same bucket without
+   losing a single object version.
+10. A standalone `terraform plan -refresh=false` against `infra/` shows nothing
    to create or delete.
-9. `destroy.sh` removes everything this deployment owns and nothing else.
+11. `destroy.sh` removes everything this deployment owns and nothing else.
 
 ## Scoring
 
@@ -138,11 +149,11 @@ The score is weighted by category. A run passes only at 100.
 
 | Category | Points |
 |---|---:|
-| Table and index design | 22 |
-| Inventory consistency | 26 |
-| Snapshot durability and restore | 30 |
-| Managed platform and isolation | 9 |
-| Redeploy and destruction | 13 |
+| Table and index design | 14 |
+| Inventory consistency | 17 |
+| Snapshot durability, restore and repair | 52 |
+| Managed platform and isolation | 8 |
+| Redeploy and destruction | 9 |
 | **Total** | **100** |
 
 Overselling stock, or deleting a resource this deployment does not own, caps

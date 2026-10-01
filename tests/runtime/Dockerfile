@@ -59,6 +59,9 @@ RUN groupadd --gid 10001 verifier \
     && useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash verifier \
     && mkdir -p /logs/verifier /workspace/config /workspace/submission /workspace/evidence \
     && chown -R verifier:verifier /logs/verifier /workspace \
+    # Host file modes are not trusted: a checkout with owner-only (0600/0700)
+    # modes would otherwise leave /tests unreadable to the verifier user.
+    && chmod -R a+rX /tests /workspace/contracts \
     && chmod 0555 /tests/test.sh
 
 WORKDIR /tests

@@ -19,7 +19,6 @@ cfg() { jq -r "$1" "$CONFIG_PATH"; }
 RESOURCE_PREFIX=$(cfg '.resource_prefix')
 REGION=$(cfg '.region')
 AWS_ENDPOINT_URL=$(cfg '.aws_endpoint_url')
-ADMIN_TOKEN=$(cfg '.admin_token')
 ENDPOINT_HOST=$(printf '%s' "$AWS_ENDPOINT_URL" | sed -E 's#^[a-zA-Z]+://##; s#[:/].*$##')
 
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
@@ -38,7 +37,7 @@ log "prefix=$RESOURCE_PREFIX region=$REGION endpoint=$AWS_ENDPOINT_URL"
 # without going through this script.
 jq '{
     region, aws_endpoint_url, resource_prefix, api_image, snapshotter_image,
-    admin_token, api_desired_count, snapshot_interval_seconds,
+    api_desired_count, snapshot_interval_seconds,
     idempotency_ttl_seconds, snapshot_noncurrent_retention_days
   }' "$CONFIG_PATH" > "${INFRA_DIR}/config.auto.tfvars.json"
 
@@ -118,48 +117,109 @@ while true; do
 done
 
 # ---- restore after table loss -------------------------------------------------
-# A table that was deleted and recreated is a new generation. Each generation
-# is restored at most once, from the newest snapshot of an earlier
-# generation, and a marker object records that it happened. Routine redeploys
-# find the marker and never restore, so rows deleted on purpose stay deleted.
-admin() { edge -H "X-Admin-Token: ${ADMIN_TOKEN}" "$@"; }
+# Deployment-owned recovery, straight against S3 and DynamoDB (the API has no
+# restore surface).
+#
+# * Generation: the stock table's CreationDateTime in epoch milliseconds.
+# * Source: the highest generation older than the current one; within it the
+#   newest committed snapshot; its committed content is the object VERSION
+#   whose sha256 equals the commit marker, even if the object was overwritten.
+# * Load: every row with PutItem conditioned on attribute_not_exists, so a row
+#   that already exists (written since the table came back, or restored by an
+#   earlier, interrupted run) is never overwritten. Resuming is therefore safe.
+# * Bookkeeping: restores/<generation>.json is written only AFTER every row is
+#   in place. A run killed mid-restore leaves no marker, so the next run
+#   finishes the job; a routine redeploy finds the marker and restores nothing.
+STOCK_TABLE="$(tf_out stock_table_name)"
+python3 - "$BUCKET" "$STOCK_TABLE" "$AWS_ENDPOINT_URL" "$REGION" > /tmp/dl-generation <<'PY'
+import hashlib, json, re, sys
+from concurrent.futures import ThreadPoolExecutor
 
-listing=""
-deadline=$(( $(date +%s) + 120 ))
-while true; do
-  listing=$(admin "${CONNECT_URL}/admin/snapshots" 2>/dev/null || true)
-  if printf '%s' "$listing" | jq -e '.current_generation != null' >/dev/null 2>&1; then
-    break
-  fi
-  [ "$(date +%s)" -ge "$deadline" ] && die "snapshot listing unavailable: ${listing:0:300}"
-  sleep 3
-done
-generation=$(printf '%s' "$listing" | jq -r '.current_generation')
-marker="restores/${generation}.json"
+import boto3
+from botocore.config import Config
 
-if "${AWSCLI[@]}" s3api head-object --bucket "$BUCKET" --key "$marker" >/dev/null 2>&1; then
-  log "generation $generation already reconciled"
-else
-  source_key=$(printf '%s' "$listing" | jq -r --arg g "$generation" \
-    '[.snapshots[] | select(.generation != $g)] | first | .key // empty')
-  result='{"restored":0}'
-  if [ -n "$source_key" ]; then
-    log "stock table generation $generation is new; restoring from $source_key"
-    result=$(admin -X POST -H 'Content-Type: application/json' \
-      -d "$(jq -cn --arg k "$source_key" '{snapshot_key: $k}')" \
-      -w '\n%{http_code}' "${CONNECT_URL}/admin/restore")
-    status=$(printf '%s' "$result" | tail -n1)
-    result=$(printf '%s' "$result" | sed '$d')
-    [ "$status" = "200" ] || die "restore failed ($status): $result"
-    log "restore result: $result"
-  else
-    log "no earlier generation to restore from"
-  fi
-  printf '%s' "$result" | jq -c --arg g "$generation" --arg k "$source_key" \
-    '{generation: $g, restored_from: (if $k == "" then null else $k end), result: .}' > /tmp/depotledger-marker.json
-  "${AWSCLI[@]}" s3api put-object --bucket "$BUCKET" --key "$marker" \
-    --body /tmp/depotledger-marker.json --content-type application/json >/dev/null
-fi
+bucket, table, endpoint, region = sys.argv[1:5]
+s3 = boto3.client("s3", endpoint_url=endpoint, region_name=region, config=Config(s3={"addressing_style": "path"}))
+ddb = boto3.client("dynamodb", endpoint_url=endpoint, region_name=region,
+                   config=Config(max_pool_connections=32, retries={"max_attempts": 10}))
+
+def log(msg):
+    print(f"[restore] {msg}", file=sys.stderr, flush=True)
+
+created = ddb.describe_table(TableName=table)["Table"]["CreationDateTime"]
+generation = str(int(round(created.timestamp() * 1000)))
+print(generation)
+marker = f"restores/{generation}.json"
+try:
+    s3.head_object(Bucket=bucket, Key=marker)
+    log(f"generation {generation} already reconciled")
+    sys.exit(0)
+except s3.exceptions.ClientError as exc:
+    if exc.response.get("Error", {}).get("Code") not in ("404", "NoSuchKey", "NotFound"):
+        raise
+
+keys = []
+for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix="snapshots/"):
+    keys += [o["Key"] for o in page.get("Contents", [])]
+pattern = re.compile(r"^snapshots/(\d+)/(\d+)\.(jsonl|committed)$")
+parsed = [(int(m.group(1)), int(m.group(2)), m.group(3)) for m in map(pattern.match, keys) if m]
+older = [g for g, _, _ in parsed if g < int(generation)]
+
+def finish(record):
+    s3.put_object(Bucket=bucket, Key=marker, Body=json.dumps(record).encode(), ContentType="application/json")
+
+if not older:
+    log("no earlier generation; nothing to restore")
+    finish({"generation": generation, "restored_from": None})
+    sys.exit(0)
+prev = max(older)
+
+source = None
+for ts in sorted({t for g, t, k in parsed if g == prev and k == "committed"}, reverse=True):
+    data_key = f"snapshots/{prev}/{ts}.jsonl"
+    sha = json.loads(s3.get_object(Bucket=bucket, Key=f"snapshots/{prev}/{ts}.committed")["Body"].read()).get("sha256")
+    versions = []
+    for page in s3.get_paginator("list_object_versions").paginate(Bucket=bucket, Prefix=data_key):
+        versions += [v["VersionId"] for v in page.get("Versions", []) if v["Key"] == data_key]
+    for vid in versions:
+        body = s3.get_object(Bucket=bucket, Key=data_key, VersionId=vid)["Body"].read()
+        if sha and hashlib.sha256(body).hexdigest() == sha:
+            source = (data_key, vid, body)
+            break
+    if source:
+        break
+    log(f"skipping {data_key}: no version matches its commit marker")
+if source is None:
+    sys.exit(f"no committed snapshot found in generation {prev}")
+
+def attr(value):
+    if isinstance(value, bool):
+        return {"BOOL": value}
+    if isinstance(value, (int, float)):
+        return {"N": str(value)}
+    if value is None:
+        return {"NULL": True}
+    return {"S": str(value)}
+
+rows = [json.loads(line) for line in source[2].decode().splitlines() if line.strip()]
+
+def put(row):
+    try:
+        ddb.put_item(TableName=table, Item={k: attr(v) for k, v in row.items()},
+                     ConditionExpression="attribute_not_exists(sku)")
+        return 1
+    except ddb.exceptions.ConditionalCheckFailedException:
+        return 0
+
+log(f"restoring {len(rows)} rows from {source[0]} version {source[1]}")
+with ThreadPoolExecutor(max_workers=16) as pool:
+    restored = sum(pool.map(put, rows))
+finish({"generation": generation, "restored_from": source[0], "version_id": source[1],
+        "rows": len(rows), "restored": restored, "skipped": len(rows) - restored})
+log(f"restored {restored}, kept {len(rows) - restored} existing")
+PY
+generation=$(head -n1 /tmp/dl-generation)
+[ -n "$generation" ] || die "could not determine the stock table generation"
 
 # ---- the snapshotter has covered the current generation -----------------------
 deadline=$(( $(date +%s) + 120 ))

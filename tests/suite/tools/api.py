@@ -34,18 +34,13 @@ class ApiResponse:
 
 
 class Api:
-    def __init__(self, base_url: str, host_header: str, admin_token: str,
-                 timeout: float = 15.0) -> None:
+    def __init__(self, base_url: str, host_header: str, timeout: float = 15.0) -> None:
         self.base_url = base_url.rstrip("/")
         self.host_header = host_header
-        self.admin_token = admin_token
         self.timeout = timeout
 
-    def request(self, method: str, path: str, body: Any = None, *,
-                admin: bool = False) -> ApiResponse:
+    def request(self, method: str, path: str, body: Any = None) -> ApiResponse:
         headers = {"Host": self.host_header}
-        if admin:
-            headers["X-Admin-Token"] = self.admin_token
         # A fresh connection per call, so concurrent callers are spread across
         # replicas instead of pinned to one keep-alive socket.
         headers["Connection"] = "close"
@@ -59,14 +54,14 @@ class Api:
             text=response.text,
         )
 
-    def get(self, path: str, **kw: Any) -> ApiResponse:
-        return self.request("GET", path, **kw)
+    def get(self, path: str) -> ApiResponse:
+        return self.request("GET", path)
 
-    def put(self, path: str, body: Any, **kw: Any) -> ApiResponse:
-        return self.request("PUT", path, body, **kw)
+    def put(self, path: str, body: Any) -> ApiResponse:
+        return self.request("PUT", path, body)
 
-    def post(self, path: str, body: Any, **kw: Any) -> ApiResponse:
-        return self.request("POST", path, body, **kw)
+    def post(self, path: str, body: Any) -> ApiResponse:
+        return self.request("POST", path, body)
 
-    def delete(self, path: str, **kw: Any) -> ApiResponse:
-        return self.request("DELETE", path, **kw)
+    def delete(self, path: str) -> ApiResponse:
+        return self.request("DELETE", path)

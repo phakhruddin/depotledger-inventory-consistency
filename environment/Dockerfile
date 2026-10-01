@@ -58,7 +58,11 @@ COPY workspace/ /workspace/
 RUN groupadd --gid 10001 agent \
     && useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash agent \
     && mkdir -p /workspace/config /workspace/submission /workspace/evidence \
-    && chown -R agent:agent /workspace/submission /workspace/evidence
+    && chown -R agent:agent /workspace/submission /workspace/evidence \
+    # Host file modes are not trusted: owner-only (0600/0700) modes in the
+    # build context would leave the contracts unreadable to the agent user.
+    && chmod a+rX /workspace \
+    && chmod -R a+rX /workspace/contracts
 
 WORKDIR /workspace
 USER agent

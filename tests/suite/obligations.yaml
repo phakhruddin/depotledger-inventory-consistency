@@ -7,7 +7,7 @@
     {
       "id": "data_model",
       "label": "Table and index design",
-      "weight": 22,
+      "weight": 14,
       "obligations": [
         "declared.table_design",
         "realized.data_plane",
@@ -17,7 +17,7 @@
     {
       "id": "consistency",
       "label": "Inventory consistency",
-      "weight": 26,
+      "weight": 17,
       "obligations": [
         "observed.stock_roundtrip",
         "observed.no_oversell",
@@ -26,19 +26,22 @@
     },
     {
       "id": "durability",
-      "label": "Snapshot durability and restore",
-      "weight": 30,
+      "label": "Snapshot durability, restore and repair",
+      "weight": 52,
       "obligations": [
         "declared.snapshot_bucket",
         "observed.snapshots_versioned",
         "lifecycle.redeploy_preserves_data",
-        "lifecycle.table_loss_restore"
+        "lifecycle.bucket_drift_repair",
+        "lifecycle.table_loss_restore",
+        "lifecycle.second_loss_committed",
+        "lifecycle.interrupted_restore"
       ]
     },
     {
       "id": "platform",
       "label": "Managed platform and isolation",
-      "weight": 9,
+      "weight": 8,
       "obligations": [
         "declared.managed_iac",
         "declared.network_and_iam"
@@ -47,7 +50,7 @@
     {
       "id": "lifecycle",
       "label": "Redeploy and destruction",
-      "weight": 13,
+      "weight": 9,
       "obligations": [
         "lifecycle.reapply_stable",
         "lifecycle.destroy_clean"
@@ -55,10 +58,10 @@
     }
   ],
   "planes": {
-    "declared": 22,
-    "realized": 8,
-    "observed": 38,
-    "lifecycle": 32
+    "declared": 17,
+    "realized": 5,
+    "observed": 25,
+    "lifecycle": 53
   },
   "hard_gates": [
     "trial.integrity",
@@ -90,7 +93,7 @@
     {
       "id": "declared.table_design",
       "plane": "declared",
-      "weight": 8,
+      "weight": 5,
       "fidelity": "state",
       "implementation": "executable",
       "given": "the data-model contract",
@@ -105,7 +108,7 @@
     {
       "id": "declared.snapshot_bucket",
       "plane": "declared",
-      "weight": 5,
+      "weight": 4,
       "fidelity": "state",
       "implementation": "executable",
       "given": "the snapshot bucket contract",
@@ -122,7 +125,7 @@
     {
       "id": "declared.network_and_iam",
       "plane": "declared",
-      "weight": 5,
+      "weight": 4,
       "fidelity": "state",
       "implementation": "executable",
       "given": "the network and IAM contracts",
@@ -140,7 +143,7 @@
     {
       "id": "realized.data_plane",
       "plane": "realized",
-      "weight": 8,
+      "weight": 5,
       "fidelity": "real",
       "implementation": "executable",
       "given": "a completed deploy",
@@ -156,7 +159,7 @@
     {
       "id": "observed.stock_roundtrip",
       "plane": "observed",
-      "weight": 8,
+      "weight": 5,
       "fidelity": "real",
       "implementation": "executable",
       "given": "a ready deployment",
@@ -171,7 +174,7 @@
     {
       "id": "observed.low_stock_index",
       "plane": "observed",
-      "weight": 6,
+      "weight": 4,
       "fidelity": "real",
       "implementation": "executable",
       "given": "the sparse low_stock index",
@@ -186,7 +189,7 @@
     {
       "id": "observed.no_oversell",
       "plane": "observed",
-      "weight": 12,
+      "weight": 8,
       "hard_gate": "observed.no_oversell",
       "fidelity": "real",
       "implementation": "executable",
@@ -202,7 +205,7 @@
     {
       "id": "observed.idempotent_reservation",
       "plane": "observed",
-      "weight": 6,
+      "weight": 4,
       "fidelity": "real",
       "implementation": "executable",
       "given": "a confirmed reservation",
@@ -218,7 +221,7 @@
     {
       "id": "observed.snapshots_versioned",
       "plane": "observed",
-      "weight": 6,
+      "weight": 4,
       "fidelity": "real",
       "implementation": "executable",
       "given": "a running snapshotter",
@@ -233,7 +236,7 @@
     {
       "id": "lifecycle.redeploy_preserves_data",
       "plane": "lifecycle",
-      "weight": 5,
+      "weight": 4,
       "fidelity": "real",
       "implementation": "executable",
       "given": "a healthy deployment with rows captured in a snapshot",
@@ -246,20 +249,68 @@
       "deadline_seconds": 900
     },
     {
-      "id": "lifecycle.table_loss_restore",
+      "id": "lifecycle.bucket_drift_repair",
       "plane": "lifecycle",
-      "weight": 14,
+      "weight": 8,
       "fidelity": "real",
       "implementation": "executable",
-      "given": "rows captured in a snapshot of the current table",
+      "given": "a healthy versioned snapshot bucket with pointer history",
+      "when": "versioning is suspended and the lifecycle configuration is deleted outside Terraform, then deploy is rerun",
+      "then": [
+        "the same bucket (same name and creation date) is versioned Enabled again",
+        "the noncurrent-version rule is back with the configured days",
+        "every earlier LATEST.json version is still retrievable",
+        "new pointer versions accrue after the repair"
+      ],
+      "deadline_seconds": 900
+    },
+    {
+      "id": "lifecycle.table_loss_restore",
+      "plane": "lifecycle",
+      "weight": 8,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "rows captured in a committed snapshot, and a newer committed snapshot of the same generation whose data object was later overwritten (its committed bytes remain as an older object version)",
       "when": "the stock table is deleted and deploy is rerun",
       "then": [
-        "when deploy returns, every row of the last snapshot of the lost table is served again",
+        "when deploy returns, every row of the committed content of the newest committed snapshot is served (first loss)",
+        "no row that exists only in the overwriting version appears, and a row present only in the committed content does appear",
         "the reservations table, the bucket and the load balancer keep their identity",
-        "an earlier order replays without taking stock",
-        "earlier snapshot versions are still in the bucket"
+        "an earlier order replays without taking stock"
       ],
       "deadline_seconds": 1200
+    },
+    {
+      "id": "lifecycle.second_loss_committed",
+      "plane": "lifecycle",
+      "weight": 12,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "a recovered table that has diverged by a delete, an update and a new row, captured in a committed snapshot, plus a newer uncommitted snapshot object of the same generation holding stale and foreign rows",
+      "when": "the stock table is deleted a second time and deploy is rerun",
+      "then": [
+        "every row of the newest committed snapshot of the lost generation is served with its values",
+        "the deleted row stays deleted and the updated row keeps its newer value",
+        "no row that exists only in the uncommitted object appears",
+        "the reservations table, the bucket and the load balancer keep their identity"
+      ],
+      "deadline_seconds": 1200
+    },
+    {
+      "id": "lifecycle.interrupted_restore",
+      "plane": "lifecycle",
+      "weight": 12,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "a stock table holding 3000 freshly seeded rows captured in a committed snapshot",
+      "when": "the stock table is deleted, deploy.sh is SIGKILLed with its whole process group as soon as the first restored row is visible in the replacement table, one already-restored row is updated and one new row is written, and deploy is rerun",
+      "then": [
+        "when the rerun returns, every row of the lost generation's newest committed snapshot is in the table with its snapshot values stored as numbers",
+        "the row updated between the runs keeps its newer value (no restored row overwrites an existing one)",
+        "the row written between the runs survives",
+        "the rerun does not recreate the stock table, and the reservations table, the bucket and the load balancer keep their identity"
+      ],
+      "deadline_seconds": 1500
     },
     {
       "id": "lifecycle.reapply_stable",
@@ -278,7 +329,7 @@
     {
       "id": "lifecycle.destroy_clean",
       "plane": "lifecycle",
-      "weight": 9,
+      "weight": 5,
       "hard_gate": "lifecycle.baseline_preserved",
       "fidelity": "real",
       "implementation": "executable",

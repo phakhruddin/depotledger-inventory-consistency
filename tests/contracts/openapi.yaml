@@ -103,60 +103,6 @@ paths:
       responses:
         "200": {description: Found., content: {application/json: {schema: {$ref: "#/components/schemas/Reservation"}}}}
         "404": {description: Unknown order_id.}
-  /admin/snapshots:
-    get:
-      summary: Snapshots in the bucket, newest first, and the current stock table generation.
-      parameters:
-        - {name: X-Admin-Token, in: header, required: true, schema: {type: string}}
-      responses:
-        "200":
-          description: Listing.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  current_generation: {type: [string, "null"]}
-                  snapshots:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        key: {type: string}
-                        generation: {type: string}
-                        taken_at_ms: {type: integer}
-                        item_count: {type: integer}
-        "401": {description: Missing or wrong token.}
-  /admin/restore:
-    post:
-      summary: Load a snapshot into the stock table without overwriting existing rows.
-      parameters:
-        - {name: X-Admin-Token, in: header, required: true, schema: {type: string}}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [snapshot_key]
-              properties:
-                snapshot_key: {type: string}
-      responses:
-        "200":
-          description: Restored.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  snapshot_key: {type: string}
-                  generation: {type: string}
-                  restored: {type: integer}
-                  skipped: {type: integer}
-        "401": {description: Missing or wrong token.}
-        "404": {description: No such snapshot object.}
-        "409": {description: "`snapshot_generation_current`: the snapshot is of the current table generation."}
-        "503": {description: "`table_unavailable`: the stock table does not exist."}
 components:
   schemas:
     Id:

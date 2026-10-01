@@ -53,8 +53,7 @@ class TrialContext:
 
     def reload_manifest(self) -> None:
         self.manifest = json.loads(self.config.manifest_path.read_text(encoding="utf-8"))
-        self.api = Api(self.manifest["edge"]["connect_url"], self.manifest["edge"]["host_header"],
-                       self.config.admin_token)
+        self.api = Api(self.manifest["edge"]["connect_url"], self.manifest["edge"]["host_header"])
 
 
 Check = Callable[[TrialContext], CheckResult]

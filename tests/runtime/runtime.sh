@@ -32,7 +32,6 @@ cat >"$config_tmp" <<JSON
   "snapshotter_image": "depotledger/snapshotter:1.0.0",
   "api_image_id": "$(image_id depotledger/api:1.0.0)",
   "snapshotter_image_id": "$(image_id depotledger/snapshotter:1.0.0)",
-  "admin_token": "dladm_$(rand 16)",
   "api_desired_count": 2,
   "snapshot_interval_seconds": 15,
   "idempotency_ttl_seconds": $ttl_seconds,

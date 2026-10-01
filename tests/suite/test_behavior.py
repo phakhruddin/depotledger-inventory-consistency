@@ -199,10 +199,26 @@ def test_idempotent_reservation(trial: TrialContext) -> CheckResult:
 
 
 def current_generation(trial: TrialContext) -> str | None:
-    response = trial.api.get("/admin/snapshots", admin=True)
-    if response.status != 200:
-        raise SubmissionFailure(f"GET /admin/snapshots returned {response.status}: {response.text[:300]}")
-    return response.json().get("current_generation")
+    """The live stock table's generation, as the contract defines it.
+
+    Generation = the table's CreationDateTime in epoch milliseconds, read with
+    DescribeTable. The snapshotter derives the same value from the raw JSON
+    timestamp; a generation directory within one millisecond of the computed
+    value is taken as the snapshotter's spelling of it (float rounding only).
+    """
+    table = trial.cloud.table(trial.stock_table)
+    if table is None:
+        return None
+    created = table.get("CreationDateTime")
+    if created is None:
+        raise SubmissionFailure("DescribeTable returned no CreationDateTime for the stock table")
+    stamp = created.timestamp() if hasattr(created, "timestamp") else float(created)
+    computed = int(round(stamp * 1000))
+    for key in trial.cloud.snapshot_keys(trial.bucket):
+        parts = key.split("/")
+        if len(parts) >= 3 and parts[1].isdigit() and abs(int(parts[1]) - computed) <= 1:
+            return parts[1]
+    return str(computed)
 
 
 def wait_for_snapshot_containing(trial: TrialContext, generation: str, rows: set[tuple[str, str]],
@@ -212,10 +228,13 @@ def wait_for_snapshot_containing(trial: TrialContext, generation: str, rows: set
     while time.monotonic() < deadline:
         keys = sorted((k for k in trial.cloud.snapshot_keys(trial.bucket)
                        if k.startswith(f"snapshots/{generation}/")), reverse=True)
-        if keys:
-            content = {(r.get("sku"), r.get("warehouse_id")) for r in trial.cloud.read_snapshot(trial.bucket, keys[0])}
+        # Only committed snapshots count: the supplied snapshotter writes the
+        # data object first and its commit marker second.
+        committed = [k for k in keys if trial.cloud.is_committed(trial.bucket, k)]
+        if committed:
+            content = {(r.get("sku"), r.get("warehouse_id")) for r in trial.cloud.read_snapshot(trial.bucket, committed[0])}
             if rows <= content:
-                return keys[0]
+                return committed[0]
         time.sleep(3)
     return None
 
@@ -227,7 +246,7 @@ def test_snapshots_versioned(trial: TrialContext) -> CheckResult:
     put_stock(trial, sku, warehouse, on_hand=5)
     generation = current_generation(trial)
     if not generation:
-        raise SubmissionFailure("the API reports no current stock table generation")
+        raise SubmissionFailure("the stock table does not exist, so it has no generation")
 
     window = trial.config.snapshot_interval * 4 + 15
     key = wait_for_snapshot_containing(trial, generation, {(sku, warehouse)}, window)

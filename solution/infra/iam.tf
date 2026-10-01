@@ -28,8 +28,8 @@ resource "aws_iam_role_policy" "execution" {
   })
 }
 
-# API: reads and writes both ledgers and their indexes, reads snapshots for
-# restore. It cannot write, overwrite or delete snapshot objects.
+# API: reads and writes both ledgers and their indexes. It has no access to the
+# snapshot bucket; restoring a lost stock table is done by deploy.sh.
 resource "aws_iam_role" "api" {
   name               = "${local.prefix}-api-task-role"
   assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
@@ -54,18 +54,6 @@ resource "aws_iam_role_policy" "api" {
           "${aws_dynamodb_table.stock.arn}/index/*",
           aws_dynamodb_table.reservations.arn,
         ]
-      },
-      {
-        Sid      = "ListSnapshots"
-        Effect   = "Allow"
-        Action   = ["s3:ListBucket"]
-        Resource = [aws_s3_bucket.snapshots.arn]
-      },
-      {
-        Sid      = "ReadSnapshots"
-        Effect   = "Allow"
-        Action   = ["s3:GetObject"]
-        Resource = ["${aws_s3_bucket.snapshots.arn}/snapshots/*"]
       },
     ]
   })

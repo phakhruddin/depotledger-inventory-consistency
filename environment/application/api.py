@@ -1,12 +1,11 @@
 """DepotLedger inventory API.
 
 Serves stock levels and reservations over HTTP. All state lives in two
-DynamoDB tables; snapshots written by the snapshotter live in S3 and can be
-restored through the admin surface.
+DynamoDB tables. The API has no snapshot or restore surface: recovering a
+lost stock table from the snapshotter's S3 objects is the deployment's job.
 """
 from __future__ import annotations
 
-import hmac
 import json
 import os
 import re
@@ -17,18 +16,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from awslite import AwsError, from_item, to_attr, to_item
-from common import (LOW_STOCK_INDEX, SNAPSHOT_PREFIX, WAREHOUSE_INDEX, clients, log,
-                    parse_snapshot_key, required, table_generation)
+from common import LOW_STOCK_INDEX, WAREHOUSE_INDEX, clients, log, required
 
 STOCK_TABLE = required("STOCK_TABLE")
 RESERVATIONS_TABLE = required("RESERVATIONS_TABLE")
-SNAPSHOT_BUCKET = required("SNAPSHOT_BUCKET")
-ADMIN_TOKEN = required("ADMIN_TOKEN")
 IDEMPOTENCY_TTL = int(os.environ.get("IDEMPOTENCY_TTL_SECONDS", "86400"))
 PORT = int(os.environ.get("PORT", "8080"))
 REPLICA = socket.gethostname()
 
-DDB, S3 = clients()
+DDB, _S3 = clients()
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 STOCK_FIELDS = ("on_hand", "reserved", "available", "reorder_point")
@@ -279,63 +275,6 @@ def get_reservation(order_id: str) -> tuple[int, dict[str, Any]]:
     return 200, public_reservation(from_item(found))
 
 
-# -- admin -------------------------------------------------------------------
-
-def list_snapshots() -> tuple[int, dict[str, Any]]:
-    current = table_generation(DDB, STOCK_TABLE)
-    snapshots = []
-    for key in S3.list_keys(SNAPSHOT_BUCKET, SNAPSHOT_PREFIX):
-        parsed = parse_snapshot_key(key)
-        if not parsed:
-            continue
-        generation, taken_at = parsed
-        try:
-            meta = S3.head_object(SNAPSHOT_BUCKET, key)
-            count = int(meta.get("x-amz-meta-item-count", "-1"))
-        except (AwsError, ValueError):
-            count = -1
-        snapshots.append({"key": key, "generation": generation,
-                          "taken_at_ms": taken_at, "item_count": count})
-    snapshots.sort(key=lambda s: s["taken_at_ms"], reverse=True)
-    return 200, {"current_generation": current, "snapshots": snapshots}
-
-
-def restore(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-    key = str(body.get("snapshot_key", ""))
-    parsed = parse_snapshot_key(key)
-    if not parsed:
-        raise ApiError(400, "invalid_request", "snapshot_key is not a snapshot object key")
-    generation, _ = parsed
-    current = table_generation(DDB, STOCK_TABLE)
-    if current is None:
-        raise ApiError(503, "table_unavailable", "the stock table does not exist")
-    if generation == current:
-        raise ApiError(409, "snapshot_generation_current",
-                       "a snapshot of the current table generation cannot be restored into it")
-    try:
-        raw, _ = S3.get_object(SNAPSHOT_BUCKET, key)
-    except AwsError as exc:
-        if exc.status == 404:
-            raise ApiError(404, "not_found", "snapshot object does not exist") from exc
-        raise
-    restored = skipped = 0
-    for line in raw.decode("utf-8").splitlines():
-        if not line.strip():
-            continue
-        item = json.loads(line)
-        try:
-            # Never overwrite: anything already present is newer than the snapshot.
-            DDB.call("PutItem", {"TableName": STOCK_TABLE, "Item": to_item(item),
-                                 "ConditionExpression": "attribute_not_exists(sku)"})
-            restored += 1
-        except AwsError as exc:
-            if exc.code != "ConditionalCheckFailedException":
-                raise
-            skipped += 1
-    log("restore_completed", snapshot_key=key, restored=restored, skipped=skipped)
-    return 200, {"snapshot_key": key, "generation": generation, "restored": restored, "skipped": skipped}
-
-
 # -- HTTP ----------------------------------------------------------------------
 
 def ready() -> tuple[int, dict[str, Any]]:
@@ -359,8 +298,6 @@ ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     ("GET", re.compile(r"^/warehouses/(?P<wh>[^/]+)/low-stock$"), "warehouse_low_stock"),
     ("POST", re.compile(r"^/reservations$"), "create_reservation"),
     ("GET", re.compile(r"^/reservations/(?P<order>[^/]+)$"), "get_reservation"),
-    ("GET", re.compile(r"^/admin/snapshots$"), "list_snapshots"),
-    ("POST", re.compile(r"^/admin/restore$"), "restore"),
 ]
 
 
@@ -385,11 +322,6 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(value, dict):
             raise ApiError(400, "invalid_json", "body must be a JSON object")
         return value
-
-    def _admin(self) -> None:
-        supplied = self.headers.get("X-Admin-Token", "")
-        if not hmac.compare_digest(supplied.encode(), ADMIN_TOKEN.encode()):
-            raise ApiError(401, "unauthorized")
 
     def _dispatch(self, method: str) -> None:
         started = time.monotonic()
@@ -422,12 +354,6 @@ class Handler(BaseHTTPRequestHandler):
                     status, payload = create_reservation(self._body())
                 elif name == "get_reservation":
                     status, payload = get_reservation(check_id(args["order"], "order_id"))
-                elif name == "list_snapshots":
-                    self._admin()
-                    status, payload = list_snapshots()
-                elif name == "restore":
-                    self._admin()
-                    status, payload = restore(self._body())
                 break
         except ApiError as exc:
             status, payload = exc.status, {"code": exc.code, "detail": exc.detail}
@@ -463,7 +389,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     log("api_starting", port=PORT, replica=REPLICA, stock_table=STOCK_TABLE,
-        reservations_table=RESERVATIONS_TABLE, snapshot_bucket=SNAPSHOT_BUCKET)
+        reservations_table=RESERVATIONS_TABLE)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
     server.serve_forever()

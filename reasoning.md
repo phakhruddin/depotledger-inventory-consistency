@@ -26,8 +26,8 @@ mistakes *observable* from outside:
   indexes alone. If an index is missing, has the wrong keys, or projects too
   little, the view fails with a named error. The API does not fall back to the
   base table, so a `KEYS_ONLY` index is visible as a product failure and not
-  hidden by a scan. The admin surface lists snapshots and restores one, and it
-  refuses to restore a snapshot into the table generation it came from.
+  hidden by a scan. Since v11 the API has no admin, listing or restore
+  surface at all: recovering a lost table is the deployment's own code.
 - The **snapshotter image** writes a consistent JSON Lines scan of the stock
   table every interval, plus a baseline snapshot the moment it sees a new
   table generation, and overwrites `snapshots/LATEST.json` each time.
@@ -49,14 +49,12 @@ package index.
    contract requires `deploy.sh` to notice the new generation and restore it
    before returning. Within about a second of recreation, the snapshotter
    writes an empty baseline of the new generation and repoints `LATEST.json`
-   at it. So "restore from LATEST" restores nothing, and the admin endpoint
-   refuses it anyway (`snapshot_generation_current`). The right source is the
-   newest snapshot of the **previous** generation, which the contract
-   describes and the listing endpoint exposes.
+   at it. So "restore from LATEST" restores nothing. The right source is the
+   newest committed snapshot of the **previous** generation, which the
+   deployment finds itself by listing the bucket.
 3. **No resurrection.** A row deleted through the API after a snapshot must
-   stay deleted across a routine redeploy. The admin endpoint already refuses
-   same-generation restores, so this check targets deployments that bypass it
-   and write snapshot rows into the live table themselves, for example with
+   stay deleted across a routine redeploy. This check targets deployments that
+   write snapshot rows into the live table on every run, for example with
    `batch-write-item` on every run. The check deletes the row and reruns
    deploy immediately. If the snapshotter takes a newer snapshot before the
    rogue restore reads one, the deleted row is absent from it and the defect
@@ -73,6 +71,83 @@ package index.
    through the load balancer, must produce exactly ten successes. The API's
    conditional update makes this correct *if* both replicas share the right
    table and key. Overselling caps the score.
+
+### What v6 adds, and why
+
+Realm v5 produced five 100% runs out of six. v6 adds two operational rules,
+both stated in the public contract and both triggered by the verifier
+deterministically, with no timing races.
+
+6. **Committed snapshots and two losses.** The snapshotter now writes each
+   snapshot in two steps: the data object, then a `.committed` marker carrying
+   the object's SHA-256. Only a marker whose `sha256` matches makes a snapshot
+   restorable. The verifier loses the stock table twice. Between the losses it
+   deletes one row, updates another and adds a third. Before the second loss
+   it leaves the exact state a snapshotter crash produces: a newer data object
+   in the live generation with no marker, holding the deleted row, the stale
+   value and a foreign row. Restore must come from the newest committed
+   snapshot of the generation that was just lost. The v5 rule every passing
+   model used, "newest snapshot of any non-current generation", picks the
+   uncommitted object.
+7. **Durable-control drift repair on the same bucket.** Versioning is suspended
+   and the lifecycle configuration deleted through the S3 API. The next deploy
+   must repair both on the same bucket, keep every earlier object version, and
+   retain new pointer versions again. Deployments that apply with
+   `-refresh=false`, or "reset" by replacing the bucket, fail.
+
+8. **Committed content survives an overwrite (v6i, after Realm v7: 3 of 6
+   full passes).** "Committed" now means that the marker exists **and some
+   version** of the data object matches the marker's `sha256`. That version
+   is the committed content, even if the object was overwritten afterwards.
+   Before the first loss, the verifier writes the newest committed snapshot
+   of the generation by the public protocol: data object, then marker. Its
+   committed content is the natural snapshot plus one late row. It then
+   overwrites the data object with stale content: a dropped row plus a poison
+   row. Only restoring the matching **version**, through the new `version_id`
+   on the restore endpoint, passes:
+   - "marker exists → restore current" brings back the poison row;
+   - "verify current hash, else skip" falls back to the older snapshot and
+     misses the late row;
+   - the v5 "newest non-current" rule does both.
+
+   This makes versioning a recovery control, not only a checkbox. It uses
+   only emulator behaviors already exercised by passing oracles: versioned
+   PUT/GET by `VersionId` and `ListObjectVersions`. No Terraform or provider
+   change is involved; the online-index idea (D) was dropped after the
+   provider could not observe a GSI added in place on Floci.
+
+9. **Deployment-owned, interruptible recovery (v11, after Realm v10: 5 of 6
+   non-Astra full passes).** v10's restore was a single admin call per loss;
+   the hard part (choosing the committed version) was a lookup, and the API
+   did the loading, the no-overwrite rule and the generation guard for the
+   agent. v11 removes `/admin/snapshots`, `/admin/restore`, `ADMIN_TOKEN`
+   and the API's bucket access. The deployment now:
+   - computes the generation from `DescribeTable` (`CreationDateTime` × 1000,
+     rounded; stated in the contract);
+   - lists the bucket, selects the committed version (A and I unchanged);
+   - writes every row with correct types (`N` for numbers) using conditional
+     `PutItem` so an existing row is never overwritten;
+   - keeps its own "restore done" bookkeeping, written only after the last
+     row.
+
+   `lifecycle.interrupted_restore` makes the last two observable and
+   deterministic. The verifier seeds 3000 rows, waits for a committed
+   snapshot, deletes the table, and runs `deploy.sh` in its own session. As
+   soon as any row is visible in the replacement table it SIGKILLs the whole
+   process group (the trigger is the first restored row, not a timer, so the
+   reference restore is always mid-flight). It then updates one restored row
+   and adds a new one directly in the table, and reruns `deploy.sh`. The
+   rerun must finish all 3000 rows, keep both newer writes, and not recreate
+   the table. Defects it catches deterministically:
+   - bookkeeping written before the rows (rerun thinks it is done);
+   - "the table has rows, so it was restored" (rerun skips);
+   - unconditional writes or `BatchWriteItem` (rerun clobbers the update);
+   - numbers restored as strings.
+
+   Everything used is already exercised by passing oracles on the pinned
+   emulator (conditional `PutItem`, `Scan`, versioned S3 reads) plus
+   `BatchWriteItem` by the verifier. No Terraform or provider behavior is
+   new; the online-GSI idea (D) stays dropped.
 
 ### What this environment enforces, and what it only records
 
@@ -150,30 +225,33 @@ sequenceDiagram
     participant V as Verifier
     participant D as deploy.sh
     participant TF as Terraform
-    participant API
+    participant DB as DynamoDB
     participant B as Bucket
     V->>V: delete stock table
     V->>D: run
     D->>TF: apply (recreates table, generation G')
-    D->>API: wait until ready through the ALB
-    D->>API: GET /admin/snapshots
+    D->>D: wait until the API is ready through the ALB
+    D->>DB: DescribeTable → G' = round(CreationDateTime × 1000)
     D->>B: head restores/G'.json
-    alt marker exists (routine redeploy)
+    alt marker exists (routine redeploy, or restore already finished)
         D-->>V: done, nothing restored
-    else new generation
-        D->>D: pick newest snapshot with generation != G'
-        D->>API: POST /admin/restore {snapshot_key}
-        API->>B: get snapshot
-        API->>API: PutItem each row IF attribute_not_exists
-        D->>B: put restores/G'.json marker
+    else not finished
+        D->>B: list snapshots/, prev = highest generation < G'
+        D->>B: newest .committed in prev; ListObjectVersions; version whose sha256 matches
+        D->>DB: PutItem each row IF attribute_not_exists(sku) (16 threads)
+        D->>B: put restores/G'.json (only after the last row)
         D-->>V: done
     end
-    V->>API: every row of G's last snapshot is served
+    V->>DB: every row of the committed content is present
 ```
 
+If the run is killed between the first `PutItem` and the marker, there is no
+marker, so the rerun repeats the restore; rows that already exist (restored
+earlier, or written since) fail their condition and are kept.
+
 The marker is one correct design, not the required one. A deployment may
-equally compare against a recorded generation, check whether the table is
-empty, or write its own restore. The checks assert the outcome: rows back,
+equally keep a progress record, or compare against a recorded generation. The
+checks assert the outcome: rows back, typed correctly, nothing overwritten,
 nothing resurrected, and other durable resources untouched.
 
 ### Destroy
@@ -192,73 +270,57 @@ flowchart TD
 
 ## Score
 
-Fourteen obligations, each all-or-nothing, grouped into five categories. The
-weights reconcile to 100 in `tests/suite/obligations.yaml`, and the verifier
-refuses to start if they do not. Only 100 passes.
+Seventeen obligations, each all-or-nothing, in five categories. The weights
+reconcile to 100 in `tests/suite/obligations.yaml`. Only 100 passes.
 
 | Category | Points | Obligations |
 |---|---:|---|
-| Snapshot durability and restore | 30 | `lifecycle.table_loss_restore` 14, `observed.snapshots_versioned` 6, `declared.snapshot_bucket` 5, `lifecycle.redeploy_preserves_data` 5 |
-| Inventory consistency | 26 | `observed.no_oversell` 12, `observed.stock_roundtrip` 8, `observed.idempotent_reservation` 6 |
-| Table and index design | 22 | `declared.table_design` 8, `realized.data_plane` 8, `observed.low_stock_index` 6 |
-| Redeploy and destruction | 13 | `lifecycle.destroy_clean` 9, `lifecycle.reapply_stable` 4 |
-| Managed platform and isolation | 9 | `declared.network_and_iam` 5, `declared.managed_iac` 4 |
+| Snapshot durability, restore and repair | 52 | `lifecycle.second_loss_committed` 12, `lifecycle.interrupted_restore` 12, `lifecycle.table_loss_restore` 8, `lifecycle.bucket_drift_repair` 8, `lifecycle.redeploy_preserves_data` 4, `observed.snapshots_versioned` 4, `declared.snapshot_bucket` 4 |
+| Inventory consistency | 17 | `observed.no_oversell` 8 (gate), `observed.stock_roundtrip` 5, `observed.idempotent_reservation` 4 |
+| Table and index design | 14 | `declared.table_design` 5, `realized.data_plane` 5, `observed.low_stock_index` 4 |
+| Redeploy and destruction | 9 | `lifecycle.destroy_clean` 5 (gate), `lifecycle.reapply_stable` 4 |
+| Managed platform and isolation | 8 | `declared.managed_iac` 4 (gate), `declared.network_and_iam` 4 |
 
-By plane: 38 points observed through real requests, 32 lifecycle, 8 realized
-from live APIs, and 22 declared from state.
+By plane: 53 lifecycle, 25 observed, 5 realized, 17 declared.
 
-What each proves, highest value first:
+Run order: declared → realized → observed → routine redeploy → drift
+repair → first loss → second loss → interrupted restore → standalone plan →
+destroy.
 
-- **`lifecycle.table_loss_restore` (14).** Rows are seeded and captured in a
-  snapshot. The stock table is deleted and `deploy.sh` is rerun. When it
-  returns, every row of that snapshot is served with the same `on_hand` and
-  `reserved`. The reservations table (by ARN and creation time), the bucket and
-  the ALB keep their identity. An earlier order still replays without taking
-  stock, and earlier snapshot versions are still present.
-- **`observed.no_oversell` (12, gate).** Thirty concurrent single-unit
-  reservations on a ten-unit row. Exactly ten succeed and twenty are refused
-  as `insufficient_stock`. The row ends at `available 0 / reserved 10`. More
-  than ten successes caps the run at 49.
-- **`observed.stock_roundtrip` (8).** Fresh rows read back by SKU, and the
-  warehouse view returns exactly that warehouse's rows from the index.
-- **`declared.table_design` (8).** Key schema and key types for both tables,
-  both GSIs with exact keys and a sufficient projection, on-demand billing,
-  PITR and TTL, all from state.
-- **`realized.data_plane` (8).** The same facts as the endpoint reports them
-  live (`DescribeTable`, `DescribeTimeToLive`, `DescribeContinuousBackups`,
-  `GetBucketVersioning`), plus healthy target count and exactly one
-  snapshotter.
-- **`lifecycle.destroy_clean` (9, gate).** After `destroy.sh`, nothing
-  carrying the prefix remains, versioned bucket included. The pre-created
-  legacy table (with its row) and legacy bucket (with its versions) are
-  intact. A leak or collateral deletion caps the run at 79.
-- **`observed.low_stock_index` (6).** A row enters the sparse index when a
-  reservation takes it to its reorder point and leaves it after restock. Low
-  rows in other warehouses never appear.
-- **`observed.idempotent_reservation` (6).** An identical replay returns the
-  original `reservation_id` with `200` and takes no units. A conflicting
-  replay is refused. The stored claim carries `expires_at` about
-  `idempotency_ttl_seconds` in the future.
-- **`observed.snapshots_versioned` (6).** A fresh row appears in a snapshot of
-  the current generation within four intervals, `LATEST.json` points at the
-  current generation, and it has more than one retained version.
-- **`declared.snapshot_bucket` (5).** Versioning, a full public access block,
-  default encryption, and noncurrent expiry equal to the per-run retention
-  value. Encryption and lifecycle are labelled declaration-only.
-- **`lifecycle.redeploy_preserves_data` (5).** A row is deleted after it was
-  snapshotted, another is written, and deploy is rerun. Identities are
-  unchanged, the deleted row stays deleted, and the newer row survives.
-- **`declared.network_and_iam` (5).** Tasks run in private subnets without
-  public IPs. The API and snapshotter have distinct task roles. The API role
-  cannot put or delete objects, the snapshotter role cannot write items, and
-  no policy is a wildcard. Declaration only.
-- **`declared.managed_iac` (4, gate).** Every scored resource family is in
-  state and the manifest resolves to it.
-- **`lifecycle.reapply_stable` (4).** `terraform plan -refresh=false` run
-  directly against `infra/` resolves every variable and plans no create or
-  delete.
+- **`lifecycle.interrupted_restore` (12).** 3000 seeded rows, a committed
+  snapshot, table deleted, `deploy.sh` SIGKILLed (whole process group) as
+  soon as any row is visible in the replacement table. One restored row is
+  updated and one new row written directly in the table; deploy is rerun.
+  Then: every snapshot row present with its values stored as `N`, the
+  updated row keeps 7777, the new row survives, the table was not recreated,
+  and the reservations table, bucket and ALB keep their identity.
+- **`lifecycle.second_loss_committed` (12).** After the first recovery, the
+  live generation diverges and a committed snapshot captures it. An
+  uncommitted, newer data object of the same generation, holding stale and
+  foreign rows, is placed in the bucket. The table is deleted again. When
+  deploy returns: every row of the newest committed snapshot is served with
+  its values, the deleted row stays deleted, the updated row keeps its new
+  value, no uncommitted-only row appears, and the reservations table, bucket
+  and ALB keep their identity.
+- **`lifecycle.bucket_drift_repair` (8).** The fault is confirmed applied. Then:
+  same bucket name and creation date, versioning `Enabled`, the rule back with
+  the configured days, every earlier pointer version retrievable, and new
+  versions accruing.
+- **`lifecycle.table_loss_restore` (8).** The first loss. The newest committed
+  snapshot's data object has been overwritten. When deploy returns, every row
+  of its committed content (the version matching the marker) must be served,
+  including the late row that exists only there. No row of the overwriting
+  version may appear.
+- All other obligations are as in v5 at the weights above. The destroy check
+  keeps the emulator `/ecs/<family>` log-group exclusion. The stock table's
+  generation is read by the verifier with `DescribeTable`, the same way the
+  contract tells the deployment to compute it.
 
-Gates: `trial.integrity` (harness faults invalidate rather than score),
-`declared.managed_iac`, `observed.no_oversell` and
+Gates: `trial.integrity`, `declared.managed_iac`, `observed.no_oversell`,
 `lifecycle.baseline_preserved`. Caps: oversell → 49, cleanup leak or
 collateral deletion → 79.
+
+Known-bad coverage lives beside the task in `../depotledger-certification-v11/`:
+seventeen variants, including `marker_before_restore`,
+`blind_overwrite_restore`, `restore_done_if_rows` and `numbers_as_strings`
+for the interrupted-restore and typing rules.

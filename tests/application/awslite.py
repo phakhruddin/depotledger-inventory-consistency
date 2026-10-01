@@ -155,8 +155,10 @@ class S3:
         _, headers, _ = self._request("PUT", self._url(bucket, key), body, extra)
         return headers
 
-    def get_object(self, bucket: str, key: str) -> tuple[bytes, dict[str, str]]:
-        _, headers, raw = self._request("GET", self._url(bucket, key))
+    def get_object(self, bucket: str, key: str,
+                   version_id: str | None = None) -> tuple[bytes, dict[str, str]]:
+        query = {"versionId": version_id} if version_id else None
+        _, headers, raw = self._request("GET", self._url(bucket, key, query))
         return raw, headers
 
     def head_object(self, bucket: str, key: str) -> dict[str, str]:

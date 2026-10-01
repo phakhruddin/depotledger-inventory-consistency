@@ -33,10 +33,6 @@ class Config:
         return str(self.values["resource_prefix"])
 
     @property
-    def admin_token(self) -> str:
-        return str(self.values["admin_token"])
-
-    @property
     def api_desired_count(self) -> int:
         return int(self.values["api_desired_count"])
 

@@ -20,8 +20,6 @@ resource "aws_ecs_task_definition" "api" {
     environment = concat(local.aws_environment, [
       { name = "STOCK_TABLE", value = aws_dynamodb_table.stock.name },
       { name = "RESERVATIONS_TABLE", value = aws_dynamodb_table.reservations.name },
-      { name = "SNAPSHOT_BUCKET", value = aws_s3_bucket.snapshots.bucket },
-      { name = "ADMIN_TOKEN", value = var.admin_token },
       { name = "IDEMPOTENCY_TTL_SECONDS", value = tostring(var.idempotency_ttl_seconds) },
     ])
     logConfiguration = {
