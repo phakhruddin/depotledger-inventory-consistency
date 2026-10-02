@@ -1,0 +1,252 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devcloud.local/depotledger/manifest.schema.json",
+  "title": "DepotLedger deployment manifest",
+  "description": "Written by deploy.sh after a successful deployment. Every identifier must be the real value returned by the cloud APIs and recorded in Terraform or OpenTofu state.",
+  "type": "object",
+  "required": [
+    "deployment",
+    "network",
+    "edge",
+    "compute",
+    "data",
+    "roles",
+    "logs"
+  ],
+  "properties": {
+    "deployment": {
+      "type": "string",
+      "description": "resource_prefix from config.json",
+      "minLength": 1
+    },
+    "network": {
+      "type": "object",
+      "required": [
+        "vpc_id",
+        "public_subnet_ids",
+        "private_subnet_ids"
+      ],
+      "properties": {
+        "vpc_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "public_subnet_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 2,
+          "uniqueItems": true
+        },
+        "private_subnet_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 2,
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "edge": {
+      "type": "object",
+      "required": [
+        "load_balancer_arn",
+        "listener_arn",
+        "dns_name",
+        "connect_url",
+        "host_header",
+        "target_group_arn"
+      ],
+      "properties": {
+        "load_balancer_arn": {
+          "type": "string",
+          "pattern": "^arn:"
+        },
+        "listener_arn": {
+          "type": "string",
+          "pattern": "^arn:"
+        },
+        "dns_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "connect_url": {
+          "type": "string",
+          "pattern": "^http://[^/]+:80/?$"
+        },
+        "host_header": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_group_arn": {
+          "type": "string",
+          "pattern": "^arn:"
+        }
+      },
+      "additionalProperties": true
+    },
+    "compute": {
+      "type": "object",
+      "required": [
+        "cluster_arn",
+        "services",
+        "desired_counts"
+      ],
+      "properties": {
+        "cluster_arn": {
+          "type": "string",
+          "pattern": "^arn:"
+        },
+        "services": {
+          "type": "object",
+          "required": [
+            "api",
+            "snapshotter"
+          ],
+          "properties": {
+            "api": {
+              "type": "string",
+              "pattern": "^arn:"
+            },
+            "snapshotter": {
+              "type": "string",
+              "pattern": "^arn:"
+            }
+          },
+          "additionalProperties": true
+        },
+        "desired_counts": {
+          "type": "object",
+          "required": [
+            "api",
+            "snapshotter"
+          ],
+          "properties": {
+            "api": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "snapshotter": {
+              "type": "integer",
+              "const": 1
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "stock_table",
+        "reservations_table",
+        "snapshot_bucket"
+      ],
+      "properties": {
+        "stock_table": {
+          "type": "object",
+          "required": [
+            "name",
+            "arn"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "arn": {
+              "type": "string",
+              "pattern": "^arn:"
+            }
+          },
+          "additionalProperties": true
+        },
+        "reservations_table": {
+          "type": "object",
+          "required": [
+            "name",
+            "arn"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "arn": {
+              "type": "string",
+              "pattern": "^arn:"
+            }
+          },
+          "additionalProperties": true
+        },
+        "snapshot_bucket": {
+          "type": "object",
+          "required": [
+            "name",
+            "arn"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "arn": {
+              "type": "string",
+              "pattern": "^arn:"
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "roles": {
+      "type": "object",
+      "required": [
+        "execution_role_arn",
+        "api_task_role_arn",
+        "snapshotter_task_role_arn"
+      ],
+      "properties": {
+        "execution_role_arn": {
+          "type": "string",
+          "pattern": "^arn:"
+        },
+        "api_task_role_arn": {
+          "type": "string",
+          "pattern": "^arn:"
+        },
+        "snapshotter_task_role_arn": {
+          "type": "string",
+          "pattern": "^arn:"
+        }
+      },
+      "additionalProperties": true
+    },
+    "logs": {
+      "type": "object",
+      "required": [
+        "api",
+        "snapshotter"
+      ],
+      "properties": {
+        "api": {
+          "type": "string",
+          "minLength": 1
+        },
+        "snapshotter": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

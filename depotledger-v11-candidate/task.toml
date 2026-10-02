@@ -1,0 +1,63 @@
+schema_version = "1.1"
+
+artifacts = [
+  { source = "/workspace/submission", destination = "submission", exclude = [
+    "*/.terraform",
+    "*/.terraform/**",
+    "*/terraform.tfstate",
+    "*/terraform.tfstate.*",
+    "*/config.auto.tfvars.json",
+    "*/.terraform.tfstate.lock.info",
+  ] },
+  { source = "/workspace/evidence", destination = "evidence" },
+]
+
+[task]
+name = "devcloud/depotledger-inventory-consistency"
+description = "Build the data platform behind a multi-warehouse inventory ledger: DynamoDB tables with sparse and projected indexes, versioned S3 snapshots, and a deploy path that restores a lost table from the right snapshot generation without resurrecting deleted rows."
+keywords = [
+  "data-and-storage",
+  "terraform",
+  "opentofu",
+  "dynamodb",
+  "global-secondary-index",
+  "conditional-writes",
+  "s3-versioning",
+  "backup-and-restore",
+  "ecs",
+]
+authors = [{ name = "Deen", email = "phab019@expert.micro1.ai" }]
+
+[metadata]
+source = "devcloudbenchmark"
+environment_id = "devcloud"
+task_id = "0"
+instance_id = "data_and_storage_depotledger_inventory_consistency"
+category = "data_and_storage"
+difficulty = "hard"
+version = "0.1.0"
+
+[agent]
+timeout_sec = 43200.0
+user = "agent"
+
+[verifier]
+timeout_sec = 7200.0
+environment_mode = "separate"
+user = "verifier"
+
+[verifier.environment]
+build_timeout_sec = 3600.0
+cpus = 4
+memory_mb = 8192
+storage_mb = 30720
+gpus = 0
+allow_internet = true
+
+[environment]
+build_timeout_sec = 3600.0
+cpus = 4
+memory_mb = 8192
+storage_mb = 30720
+gpus = 0
+allow_internet = true

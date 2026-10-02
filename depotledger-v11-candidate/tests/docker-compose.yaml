@@ -1,0 +1,87 @@
+services:
+  main:
+    build:
+      context: .
+      dockerfile: runtime/Dockerfile
+      target: verifier
+    command: ["sleep", "infinity"]
+    user: "10001:10001"
+    depends_on:
+      runtime-setup:
+        condition: service_completed_successfully
+      floci:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://aws:4566
+      DEPOTLEDGER_SUBMISSION_DIR: /workspace/submission
+      DEPOTLEDGER_CONFIG: /workspace/config/config.json
+      DEPOTLEDGER_BACKUP_CONFIG: /workspace/runtime-config/config.json
+      DEPOTLEDGER_LOGS_DIR: /logs/verifier
+    networks:
+      - verifier-control
+    volumes:
+      - submission-data:/workspace/submission
+      - evidence-data:/workspace/evidence
+      - harbor-artifacts:/logs/artifacts
+      - runtime-config:/workspace/config
+      - backup-config:/workspace/runtime-config:ro
+
+  runtime-setup:
+    build:
+      context: .
+      dockerfile: runtime/Dockerfile
+      target: runtime-setup
+    command: ["/bin/sh", "/runtime.sh"]
+    environment:
+      DOCKER_BUILDKIT: "1"
+    networks:
+      - verifier-control
+    restart: "no"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runtime-config:/config
+      - backup-config:/backup-config
+      - submission-data:/submission
+
+  floci:
+    image: mirror.gcr.io/floci/floci:1.5.33@sha256:d2ecc8035822b23b8587a56eab15edd825f41d3fb80d93e8e66680410beddc08
+    pull_policy: missing
+    environment:
+      FLOCI_DOCKER_DOCKER_HOST: unix:///var/run/docker.sock
+      FLOCI_DOCKER_RESOURCE_NAMESPACE: ${COMPOSE_PROJECT_NAME}
+      FLOCI_HOSTNAME: aws
+      FLOCI_DEFAULT_REGION: us-east-1
+      FLOCI_STORAGE_MODE: persistent
+      FLOCI_STORAGE_PERSISTENT_PATH: /app/data
+      FLOCI_STORAGE_PRUNE_VOLUMES_ON_DELETE: "true"
+      FLOCI_SERVICES_DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME}_workload
+      FLOCI_SERVICES_ECS_MOCK: "false"
+      FLOCI_SERVICES_ECS_DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME}_workload
+    networks:
+      verifier-control:
+        aliases: [aws]
+      workload:
+        aliases: [aws]
+    restart: unless-stopped
+    volumes:
+      - floci-data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+
+networks:
+  verifier-control:
+    internal: true
+  workload:
+    name: ${COMPOSE_PROJECT_NAME}_workload
+    internal: true
+
+volumes:
+  floci-data: {}
+  runtime-config: {}
+  backup-config: {}
+  submission-data: {}
+  evidence-data: {}
+  harbor-artifacts: {}

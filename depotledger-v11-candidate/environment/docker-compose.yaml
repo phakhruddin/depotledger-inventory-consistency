@@ -1,0 +1,90 @@
+services:
+  main:
+    command: [ "sleep", "infinity" ]
+    user: "10001:10001"
+    depends_on:
+      runtime-setup:
+        condition: service_completed_successfully
+      floci:
+        condition: service_healthy
+    environment:
+      HTTP_PROXY: http://172.20.0.1:18080
+      http_proxy: http://172.20.0.1:18080
+      HTTPS_PROXY: http://172.20.0.1:18080
+      https_proxy: http://172.20.0.1:18080
+      NO_PROXY: localhost,127.0.0.1,::1,aws,floci,runtime-setup
+      no_proxy: localhost,127.0.0.1,::1,aws,floci,runtime-setup
+      CURL_CA_BUNDLE: /etc/daytona-netleash-ca.crt
+      SSL_CERT_FILE: /etc/daytona-netleash-ca.crt
+      REQUESTS_CA_BUNDLE: /etc/daytona-netleash-ca.crt
+      NODE_EXTRA_CA_CERTS: /etc/daytona-netleash-ca.crt
+    networks:
+      - solver-control
+      - agent
+    # Drop everything, then restore only what the harness genuinely needs.
+    # no-new-privileges is deliberately absent: the agent bootstrap runs apt
+    # through `docker compose exec`, and apt drops to `_apt`, which needs
+    # SETUID/SETGID. DAC_READ_SEARCH lets Harbor's root `tar` read a mode-0600
+    # file the agent may create under a declared artifact path.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - DAC_READ_SEARCH
+    volumes:
+      - config:/workspace/config:ro
+      - /etc/daytona/netleash/ca.crt:/etc/daytona-netleash-ca.crt:ro
+
+  runtime-setup:
+    build:
+      context: ./application
+      dockerfile: Dockerfile.runtime
+      target: runtime-setup
+    command: [ "/bin/sh", "/runtime.sh" ]
+    environment:
+      DOCKER_BUILDKIT: "1"
+    networks:
+      - solver-control
+    restart: "no"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./application:/application:ro
+      - ./runtime.sh:/runtime.sh:ro
+      - config:/config
+
+  floci:
+    image: mirror.gcr.io/floci/floci:1.5.33@sha256:d2ecc8035822b23b8587a56eab15edd825f41d3fb80d93e8e66680410beddc08
+    pull_policy: missing
+    environment:
+      FLOCI_DOCKER_DOCKER_HOST: unix:///var/run/docker.sock
+      FLOCI_DOCKER_RESOURCE_NAMESPACE: ${COMPOSE_PROJECT_NAME}
+      FLOCI_HOSTNAME: aws
+      FLOCI_DEFAULT_REGION: us-east-1
+      FLOCI_STORAGE_MODE: persistent
+      FLOCI_STORAGE_PERSISTENT_PATH: /app/data
+      FLOCI_STORAGE_PRUNE_VOLUMES_ON_DELETE: "true"
+      FLOCI_SERVICES_DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME}_workload
+      FLOCI_SERVICES_ECS_MOCK: "false"
+      FLOCI_SERVICES_ECS_DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME}_workload
+    networks:
+      solver-control:
+        aliases: [ aws ]
+      workload:
+        aliases: [ aws ]
+    restart: unless-stopped
+    volumes:
+      - floci-data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+
+networks:
+  agent: {}
+  solver-control:
+    internal: true
+  workload:
+    name: ${COMPOSE_PROJECT_NAME}_workload
+    internal: true
+
+volumes:
+  floci-data: {}
+  config: {}

@@ -1,0 +1,345 @@
+{
+  "schema_version": "1.1",
+  "benchmark": "DepotLedger Inventory Consistency",
+  "total_points": 100,
+  "pass_threshold": 100,
+  "categories": [
+    {
+      "id": "data_model",
+      "label": "Table and index design",
+      "weight": 14,
+      "obligations": [
+        "declared.table_design",
+        "realized.data_plane",
+        "observed.low_stock_index"
+      ]
+    },
+    {
+      "id": "consistency",
+      "label": "Inventory consistency",
+      "weight": 17,
+      "obligations": [
+        "observed.stock_roundtrip",
+        "observed.no_oversell",
+        "observed.idempotent_reservation"
+      ]
+    },
+    {
+      "id": "durability",
+      "label": "Snapshot durability, restore and repair",
+      "weight": 52,
+      "obligations": [
+        "declared.snapshot_bucket",
+        "observed.snapshots_versioned",
+        "lifecycle.redeploy_preserves_data",
+        "lifecycle.bucket_drift_repair",
+        "lifecycle.table_loss_restore",
+        "lifecycle.second_loss_committed",
+        "lifecycle.interrupted_restore"
+      ]
+    },
+    {
+      "id": "platform",
+      "label": "Managed platform and isolation",
+      "weight": 8,
+      "obligations": [
+        "declared.managed_iac",
+        "declared.network_and_iam"
+      ]
+    },
+    {
+      "id": "lifecycle",
+      "label": "Redeploy and destruction",
+      "weight": 9,
+      "obligations": [
+        "lifecycle.reapply_stable",
+        "lifecycle.destroy_clean"
+      ]
+    }
+  ],
+  "planes": {
+    "declared": 17,
+    "realized": 5,
+    "observed": 25,
+    "lifecycle": 53
+  },
+  "hard_gates": [
+    "trial.integrity",
+    "declared.managed_iac",
+    "observed.no_oversell",
+    "lifecycle.baseline_preserved"
+  ],
+  "score_caps": {
+    "oversell": 49,
+    "cleanup_leak": 79
+  },
+  "obligations": [
+    {
+      "id": "declared.managed_iac",
+      "plane": "declared",
+      "weight": 4,
+      "hard_gate": "declared.managed_iac",
+      "fidelity": "state",
+      "implementation": "executable",
+      "given": "a submission containing Terraform or OpenTofu infrastructure",
+      "when": "the verifier reads machine-readable state",
+      "then": [
+        "state parses and every scored resource family is managed",
+        "both tables, the bucket and its versioning, the load balancer and both ECS services are declared",
+        "the manifest conforms to the published schema and resolves to state"
+      ],
+      "deadline_seconds": 120
+    },
+    {
+      "id": "declared.table_design",
+      "plane": "declared",
+      "weight": 5,
+      "fidelity": "state",
+      "implementation": "executable",
+      "given": "the data-model contract",
+      "when": "the stock and reservations tables are read from state",
+      "then": [
+        "key schemas and key attribute types match the contract",
+        "both indexes exist with the documented keys and a projection carrying every required attribute",
+        "on-demand billing, point-in-time recovery on stock, TTL on expires_at for reservations"
+      ],
+      "deadline_seconds": 60
+    },
+    {
+      "id": "declared.snapshot_bucket",
+      "plane": "declared",
+      "weight": 4,
+      "fidelity": "state",
+      "implementation": "executable",
+      "given": "the snapshot bucket contract",
+      "when": "bucket resources are read from state",
+      "then": [
+        "versioning is Enabled",
+        "all four public access block settings are true",
+        "default encryption is configured",
+        "an enabled rule expires noncurrent versions after exactly the configured days"
+      ],
+      "note": "Declaration only for encryption and lifecycle: this endpoint records them without simulating their effect.",
+      "deadline_seconds": 60
+    },
+    {
+      "id": "declared.network_and_iam",
+      "plane": "declared",
+      "weight": 4,
+      "fidelity": "state",
+      "implementation": "executable",
+      "given": "the network and IAM contracts",
+      "when": "ECS services and role policies are read from state",
+      "then": [
+        "every service runs in private subnets with no public IP",
+        "the API and snapshotter use distinct task roles",
+        "the API role cannot write or delete bucket objects",
+        "the snapshotter role cannot write table items",
+        "no policy grants a wildcard action"
+      ],
+      "note": "Declaration only. This endpoint records IAM policies and security groups without enforcing them; no check claims a call was denied.",
+      "deadline_seconds": 60
+    },
+    {
+      "id": "realized.data_plane",
+      "plane": "realized",
+      "weight": 5,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "a completed deploy",
+      "when": "tables, indexes, TTL, backups, bucket and services are discovered through cloud APIs",
+      "then": [
+        "both tables are ACTIVE with the contracted key schema and both indexes ACTIVE",
+        "TTL and point-in-time recovery report enabled",
+        "bucket versioning reports Enabled",
+        "the API target group has the configured number of healthy targets and exactly one snapshotter task runs"
+      ],
+      "deadline_seconds": 180
+    },
+    {
+      "id": "observed.stock_roundtrip",
+      "plane": "observed",
+      "weight": 5,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "a ready deployment",
+      "when": "fresh stock rows are written through the load balancer and read back by SKU and by warehouse",
+      "then": [
+        "writes are acknowledged and read back with consistent values",
+        "the warehouse view returns exactly the rows written for that warehouse from the index",
+        "requests are served by more than one replica"
+      ],
+      "deadline_seconds": 120
+    },
+    {
+      "id": "observed.low_stock_index",
+      "plane": "observed",
+      "weight": 4,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "the sparse low_stock index",
+      "when": "rows are moved across their reorder point by writes and reservations",
+      "then": [
+        "a row at or below its reorder point appears in the low-stock view",
+        "a restocked row disappears from it",
+        "rows of other warehouses never appear"
+      ],
+      "deadline_seconds": 120
+    },
+    {
+      "id": "observed.no_oversell",
+      "plane": "observed",
+      "weight": 8,
+      "hard_gate": "observed.no_oversell",
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "a fresh row with a small number of units",
+      "when": "many concurrent single-unit reservations are sent across the replicas",
+      "then": [
+        "exactly as many reservations succeed as units existed",
+        "every other request is refused as insufficient_stock",
+        "the stored row ends with available 0 and reserved equal to on_hand"
+      ],
+      "deadline_seconds": 180
+    },
+    {
+      "id": "observed.idempotent_reservation",
+      "plane": "observed",
+      "weight": 4,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "a confirmed reservation",
+      "when": "the same order is replayed, and replayed with a different body",
+      "then": [
+        "an identical replay returns the original reservation_id with 200",
+        "the replay takes no further units",
+        "a conflicting replay is refused",
+        "the stored claim carries expires_at within the configured TTL"
+      ],
+      "deadline_seconds": 120
+    },
+    {
+      "id": "observed.snapshots_versioned",
+      "plane": "observed",
+      "weight": 4,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "a running snapshotter",
+      "when": "a fresh row is written and the bucket is watched",
+      "then": [
+        "a snapshot containing the fresh row appears within four intervals",
+        "snapshots/LATEST.json points at a snapshot of the current generation",
+        "LATEST.json has more than one retained version"
+      ],
+      "deadline_seconds": 180
+    },
+    {
+      "id": "lifecycle.redeploy_preserves_data",
+      "plane": "lifecycle",
+      "weight": 4,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "a healthy deployment with rows captured in a snapshot",
+      "when": "one row is deleted through the API, another written, and deploy is rerun",
+      "then": [
+        "neither table and not the bucket is replaced",
+        "the deleted row is not resurrected",
+        "the row written after the snapshot survives"
+      ],
+      "deadline_seconds": 900
+    },
+    {
+      "id": "lifecycle.bucket_drift_repair",
+      "plane": "lifecycle",
+      "weight": 8,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "a healthy versioned snapshot bucket with pointer history",
+      "when": "versioning is suspended and the lifecycle configuration is deleted outside Terraform, then deploy is rerun",
+      "then": [
+        "the same bucket (same name and creation date) is versioned Enabled again",
+        "the noncurrent-version rule is back with the configured days",
+        "every earlier LATEST.json version is still retrievable",
+        "new pointer versions accrue after the repair"
+      ],
+      "deadline_seconds": 900
+    },
+    {
+      "id": "lifecycle.table_loss_restore",
+      "plane": "lifecycle",
+      "weight": 8,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "rows captured in a committed snapshot, and a newer committed snapshot of the same generation whose data object was later overwritten (its committed bytes remain as an older object version)",
+      "when": "the stock table is deleted and deploy is rerun",
+      "then": [
+        "when deploy returns, every row of the committed content of the newest committed snapshot is served (first loss)",
+        "no row that exists only in the overwriting version appears, and a row present only in the committed content does appear",
+        "the reservations table, the bucket and the load balancer keep their identity",
+        "an earlier order replays without taking stock"
+      ],
+      "deadline_seconds": 1200
+    },
+    {
+      "id": "lifecycle.second_loss_committed",
+      "plane": "lifecycle",
+      "weight": 12,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "a recovered table that has diverged by a delete, an update and a new row, captured in a committed snapshot, plus a newer uncommitted snapshot object of the same generation holding stale and foreign rows",
+      "when": "the stock table is deleted a second time and deploy is rerun",
+      "then": [
+        "every row of the newest committed snapshot of the lost generation is served with its values",
+        "the deleted row stays deleted and the updated row keeps its newer value",
+        "no row that exists only in the uncommitted object appears",
+        "the reservations table, the bucket and the load balancer keep their identity"
+      ],
+      "deadline_seconds": 1200
+    },
+    {
+      "id": "lifecycle.interrupted_restore",
+      "plane": "lifecycle",
+      "weight": 12,
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "a stock table holding 3000 freshly seeded rows captured in a committed snapshot",
+      "when": "the stock table is deleted, deploy.sh is SIGKILLed with its whole process group as soon as the first restored row is visible in the replacement table, one already-restored row is updated and one new row is written, and deploy is rerun",
+      "then": [
+        "when the rerun returns, every row of the lost generation's newest committed snapshot is in the table with its snapshot values stored as numbers",
+        "the row updated between the runs keeps its newer value (no restored row overwrites an existing one)",
+        "the row written between the runs survives",
+        "the rerun does not recreate the stock table, and the reservations table, the bucket and the load balancer keep their identity"
+      ],
+      "deadline_seconds": 1500
+    },
+    {
+      "id": "lifecycle.reapply_stable",
+      "plane": "lifecycle",
+      "weight": 4,
+      "fidelity": "state+real",
+      "implementation": "executable",
+      "given": "a repaired deployment",
+      "when": "a plan is generated directly against the submission's infrastructure directory",
+      "then": [
+        "the plan resolves every variable without running deploy",
+        "no resource is planned for creation or deletion"
+      ],
+      "deadline_seconds": 600
+    },
+    {
+      "id": "lifecycle.destroy_clean",
+      "plane": "lifecycle",
+      "weight": 5,
+      "hard_gate": "lifecycle.baseline_preserved",
+      "fidelity": "real",
+      "implementation": "executable",
+      "given": "the inventory captured before deployment, including pre-existing legacy resources",
+      "when": "destroy runs and the environment is inventoried again",
+      "then": [
+        "no resource carrying this deployment's prefix remains, the versioned bucket included",
+        "the pre-existing legacy table and bucket are untouched"
+      ],
+      "deadline_seconds": 900
+    }
+  ]
+}
